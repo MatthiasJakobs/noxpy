@@ -1,4 +1,9 @@
 *.ndf
 *.txt
+*.TXT
 *.nef
+*.bak
 *.ndb
+test.png
+*.xml
+*.XML
