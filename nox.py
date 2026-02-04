@@ -1,3 +1,4 @@
+import pathlib
 import numpy as np
 import xml.etree.ElementTree as ET
 import datetime
@@ -60,8 +61,10 @@ def header_xml_to_dict(header_xml):
         else:
             header[name.lower()] = value
 
-    for key in ['scale', 'offset', 'samplingrate']:
+    for key in ['scale', 'offset']:
         header[key] = float(header[key])
+
+    header['samplingrate'] = round(float(header['samplingrate']))
 
     return header
 
@@ -103,7 +106,7 @@ def parse_ndf(path, verbose=False):
                 # Get header
                 header = parse_header(f, length)
                 channel['header'] = header
-                channel['sampling_rate'] = header['samplingrate']
+                channel['sampling_rate'] = round(float(header['samplingrate']))
                 channel['offset'] = header['offset']
                 channel['scale'] = header['scale']
             elif typ == 1:
@@ -123,22 +126,21 @@ def parse_ndf(path, verbose=False):
                 channel['start'].append(start_time)
                 if len(channel['start']) > 1:
                     channel['gap'].append((channel['start'][-1] - channel['end'][-1]))
-
-            elif typ == 144:
-                raise NotImplementedError('144')
-            elif typ == 514:
+            elif typ == 514 or typ == 144:
                 # Sampling rate again?
                 sampling_rate = read_double(f)
-                channel['sampling_rate'] = sampling_rate
-                # TODO: I'm pretty sure the sampling rate is in Hz anyway.
-                #       Maybe it makes more sense to round to an integer.
-                #       That way they would not change over time
-
+                channel['sampling_rate'] = round(float(sampling_rate))
             elif typ == 513:
                 # Data
                 fmt = channel['header']['format']
                 if fmt == 'Int16':
                     raw = np.frombuffer(f.read(length), dtype=np.int16)
+                    channel['data'].append(channel['scale']*np.array(raw)+channel['offset'])
+                elif fmt == 'UInt32':
+                    raw = np.frombuffer(f.read(length), dtype=np.uint32)
+                    channel['data'].append(channel['scale']*np.array(raw)+channel['offset'])
+                elif fmt == 'Int32':
+                    raw = np.frombuffer(f.read(length), dtype=np.int32)
                     channel['data'].append(channel['scale']*np.array(raw)+channel['offset'])
                 elif fmt == 'Byte':
                     raw = np.frombuffer(f.read(length), dtype=np.uint8)
@@ -149,7 +151,7 @@ def parse_ndf(path, verbose=False):
 
                 if length > 0:
                     start = np.datetime64(channel['start'][-1], 'ns')
-                    offset_ns = (np.arange(length // 2, dtype=np.int64)*1000000000) // channel['sampling_rate']
+                    offset_ns = (np.arange(raw.shape[0], dtype=np.int64)*1000000000) // channel['sampling_rate']
                     new_t = start + offset_ns.astype('timedelta64[ns]')
                     channel['t'].append(new_t)
                     channel['end'].append(new_t[-1])
@@ -159,22 +161,14 @@ def parse_ndf(path, verbose=False):
         print(channel)
     return channel
 
-def main():
-    import glob
-    import tqdm
-    ndfs = list(glob.glob('**/*.ndf'))
-    n = len(ndfs)
-    print(n)
-    correct = 0
-    for ndf_file in tqdm.tqdm(ndfs):
-        try:
-            parse_ndf(ndf_file)
-            correct += 1
-        except:
-            print(ndf_file)
-    print(correct, n)
+def read_patient(path):
+    channels = {}
+    channel_paths = list(pathlib.Path(path).glob('*.ndf'))
+    for channel_path in channel_paths:
+        channel_obj = parse_ndf(channel_path)
+        channel_name = channel_obj['header']['label']
+        channels[channel_name] = channel_obj
+
+    return channels
 
 
-
-if __name__ == '__main__':
-    main()
