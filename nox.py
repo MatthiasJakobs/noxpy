@@ -1,8 +1,10 @@
+import pandas as pd
 import pathlib
 import numpy as np
 import xml.etree.ElementTree as ET
-import datetime
 import struct
+import sqlite3
+from datetime import datetime
 
 def read_uint8(f):
     return struct.unpack('<B', f.read(1))[0]
@@ -57,14 +59,14 @@ def header_xml_to_dict(header_xml):
     for elem in header_xml:
         name, value = elem.tag, elem.text
         if name == 'Properties':
-            header['properties'] = parse_properties(elem)
+            header['properties'] = parse_properties(elem).copy()
         else:
             header[name.lower()] = value
 
-    for key in ['scale', 'offset']:
+    for key in ['scale', 'offset', 'samplingrate']:
         header[key] = float(header[key])
-
-    header['samplingrate'] = round(float(header['samplingrate']))
+    for key in ['channelnumber']:
+        header[key] = int(header[key])
 
     return header
 
@@ -76,99 +78,193 @@ def parse_header(f, length):
     header_xml = ET.fromstring(header_raw)
     return header_xml_to_dict(header_xml)
 
+class NoxReader:
 
-def parse_ndf(path, verbose=False):
-    channel = {}
-    with open(path, 'rb') as f:
+    def __init__(self, path):
+        self.path = pathlib.Path(path)
+        self.channel_headers = {}
+        self.channel_data_locations = {}
 
-        magic = f.read(4) # Starts with 'NOX\x03' string
+        self._read_channel_headers()
+        self._load_recording_metadata()
 
-        channel['start'] = []
-        channel['end'] = []
-        channel['gap'] = []
-        channel['data'] = []
-        channel['t'] = []
+    def _load_recording_metadata(self):
+        db_file = self.path.joinpath('Data.ndb')
+        con = sqlite3.connect(db_file)
+        cur = con.cursor()
 
-        while True:
-            current_position = f.tell()
-            f.seek(0, 2)  # Move to end
-            file_size = f.tell()
-            f.seek(current_position)  # Move back
+        # Initialize raw data dicts
+        self._recording_info = {}
+        self._subject_info = {}
+        self._device_info = {}
+        self._technician_info = {}
 
-            if current_position == file_size:
-                break
-
-            # Read block and determine action
-            typ = read_uint16(f)
-            length = read_uint32(f)
-
-            if typ == 256:
-                # Get header
-                header = parse_header(f, length)
-                channel['header'] = header
-                channel['sampling_rate'] = round(float(header['samplingrate']))
-                channel['offset'] = header['offset']
-                channel['scale'] = header['scale']
-            elif typ == 1:
-                # Get Hash
-                hash_ = ''.join([chr(read_uint16(f)) for _ in range(length//2)])
-                # TODO: Lets do nothing with this for now
-            elif typ == 512:
-                # Start time
-                d = ''.join([chr(read_uint16(f)) for _ in range(length//2)])
-                if length == 36:
-                    print('Start time length not correct. TODO')
-                    start_time = datetime.datetime.strptime(d, '%Y%m%dT%H%M%S')
-                else:
-                    start_time = datetime.datetime.strptime(d, '%Y%m%dT%H%M%S.%f')
-                # This is the intended way as np.datetime64 cannot take a format string
-                start_time = np.datetime64(start_time, 'ns')
-                channel['start'].append(start_time)
-                if len(channel['start']) > 1:
-                    channel['gap'].append((channel['start'][-1] - channel['end'][-1]))
-            elif typ == 514 or typ == 144:
-                # Sampling rate again?
-                sampling_rate = read_double(f)
-                channel['sampling_rate'] = round(float(sampling_rate))
-            elif typ == 513:
-                # Data
-                fmt = channel['header']['format']
-                if fmt == 'Int16':
-                    raw = np.frombuffer(f.read(length), dtype=np.int16)
-                    channel['data'].append(channel['scale']*np.array(raw)+channel['offset'])
-                elif fmt == 'UInt32':
-                    raw = np.frombuffer(f.read(length), dtype=np.uint32)
-                    channel['data'].append(channel['scale']*np.array(raw)+channel['offset'])
-                elif fmt == 'Int32':
-                    raw = np.frombuffer(f.read(length), dtype=np.int32)
-                    channel['data'].append(channel['scale']*np.array(raw)+channel['offset'])
-                elif fmt == 'Byte':
-                    raw = np.frombuffer(f.read(length), dtype=np.uint8)
-                    raw = mu2lin(raw)
-                    channel['data'].append(channel['scale']*np.array(raw)+channel['offset'])
-                else:
-                    raise NotImplementedError('Unknown format', channel['header']['format'])
-
-                if length > 0:
-                    start = np.datetime64(channel['start'][-1], 'ns')
-                    offset_ns = (np.arange(raw.shape[0], dtype=np.int64)*1000000000) // channel['sampling_rate']
-                    new_t = start + offset_ns.astype('timedelta64[ns]')
-                    channel['t'].append(new_t)
-                    channel['end'].append(new_t[-1])
+        res = cur.execute('SELECT key, type, value, name FROM internal_property;').fetchall()
+        for (key, datatype, value, name) in res:
+            if datatype == 'Long':
+                value = int(value)
+            elif datatype == 'Bool':
+                value = eval(value)
+            elif datatype == 'Double':
+                value = float(value)
+            elif datatype == 'Ticks':
+                value = np.datetime64('0001-01-01') + np.timedelta64(int(value) // 10, 'us')
+            elif datatype == 'Text':
+                value = str(value)
             else:
-                raise NotImplementedError('Unknown code', typ, 'with length', length)
-    if verbose:
-        print(channel)
-    return channel
+                raise Exception('Unknown datatype', datatype)
 
-def read_patient(path):
-    channels = {}
-    channel_paths = list(pathlib.Path(path).glob('*.ndf'))
-    for channel_path in channel_paths:
-        channel_obj = parse_ndf(channel_path)
-        channel_name = channel_obj['header']['label']
-        channels[channel_name] = channel_obj
+            if name == 'SubjectInfo':
+                self._subject_info[key] = value
+            elif name == 'DeviceInfo':
+                self._device_info[key] = value
+            elif name == 'RecordingInfo':
+                self._recording_info[key] = value
+            elif name == 'TechnicianInfo':
+                self._technician_info[key] = value
 
-    return channels
+    def _parse_ndf_header(self, path):
+        header = {}
+        data_locs = []
+        with open(path, 'rb') as f:
+            magic = f.read(4) 
+            assert magic == b'NOX\x03'
 
+            while True:
+                current_position = f.tell()
+                f.seek(0, 2)  # Move to end
+                file_size = f.tell()
+                f.seek(current_position)  # Move back
+
+                if current_position == file_size:
+                    break
+
+                # Read block and determine action
+                typ = read_uint16(f)
+                length = read_uint32(f)
+
+                if typ == 256:
+                    # Get NDF header
+                    ndf_header = parse_header(f, length)
+                    header = ndf_header
+                elif typ == 1:
+                    # Get Hash
+                    hash_ = ''.join([chr(read_uint16(f)) for _ in range(length//2)])
+                    header['hash'] = hash_
+                elif typ == 512:
+                    # Start time
+                    d = ''.join([chr(read_uint16(f)) for _ in range(length//2)])
+                    if length == 36:
+                        print('Start time length not correct. TODO')
+                        start_time = datetime.strptime(d, '%Y%m%dT%H%M%S')
+                    else:
+                        start_time = datetime.strptime(d, '%Y%m%dT%H%M%S.%f')
+
+                    start_time = np.datetime64(start_time, 'ns')
+                    header['start_time'] = start_time
+                elif typ == 514 or typ == 144:
+                    sampling_rate = read_double(f)
+                    header['samplingrate'] = float(sampling_rate)
+                elif typ == 513:
+                    # Data blocks
+                    fmt = header['format']
+                    data_locs.append([fmt, f.tell(), length, path])
+                    f.seek(length, 1)
+                    continue
+                else:
+                    raise NotImplementedError('Unknown code', typ, 'with length', length)
+
+        return header, data_locs
+
+    def _read_channel_headers(self):
+        channel_paths = list(self.path.glob('*.ndf'))
+        for i, channel_path in enumerate(channel_paths):
+            channel_header, channel_data_location = self._parse_ndf_header(channel_path)
+            self.channel_headers[i] = channel_header
+            self.channel_data_locations[i] = channel_data_location
+        self.n_channels = len(channel_paths)
+
+    def getSignalHeader(self, idx):
+        return self.channel_headers[idx]
+
+    def getSignalHeaders(self):
+        return list(self.channel_headers.values())
+
+    def getSignalLabels(self):
+        return [head['label'] for head in self.getSignalHeaders()]
+
+    def getStartdatetime(self):
+        return self._recording_info['RecordingStart']
+
+    def getFileDuration(self, datarecord_duration=10.0):
+        # Compatibility with EDF files: Assume a fixed block size for each data record and round accordingly
+        rec_start = self._recording_info['RecordingStart']
+        rec_stop = self._recording_info['RecordingStop']
+        file_duration_seconds = (rec_stop - rec_start) / np.timedelta64(1, 's')
+        n_datarecords = np.ceil(file_duration_seconds / datarecord_duration)
+        file_duration = float(n_datarecords * datarecord_duration)
+
+        return file_duration
+
+    def getSampleFrequency(self, idx):
+        return self.channel_headers[idx]['samplingrate']
+
+    def getNSamples(self):
+        recording_seconds = self.getFileDuration()
+
+        def _getNSamples(idx):
+            sr = float(round(self.getSampleFrequency(idx)))
+            return int(recording_seconds * sr)
+
+        return [_getNSamples(idx) for idx in range(self.n_channels)]
+
+    def readSignal(self, idx, start=0, n=None, digital=False):
+
+        loc = self.channel_data_locations[idx]
+        if len(loc) > 1:
+            raise NotImplementedError('Channel', idx, 'has gaps. Not yet implemented')
+        fmt, tell, length, filepath = loc[0]
+
+        # Actually get the data now
+        with open(filepath, 'rb') as f:
+            f.seek(tell, 0)
+            if fmt == 'Int16':
+                signal = np.frombuffer(f.read(length), dtype=np.int16)
+            elif fmt == 'Int32':
+                signal = np.frombuffer(f.read(length), dtype=np.int32)
+            else:
+                raise NotImplementedError('Unknown data format', fmt)
+
+        recording_start = self.getStartdatetime()
+        sr = self.getSampleFrequency(idx)
+        timestamps = pd.date_range(start=self.getSignalHeader(idx)['start_time'], periods=len(signal), freq=pd.to_timedelta(1/sr, unit='s'))
+
+        sr_rounded = float(round(sr))
+        s = pd.Series(signal, index=timestamps).resample(f'{1/sr_rounded}s').mean()
+        timestamps = s.index.to_numpy().squeeze()
+        signal = s.to_numpy().squeeze()
+
+        # TODO: Still not 100%. Sometimes off by 1, sometimes by -1, sometimes 2 
+        #       Good enough for now
+        pad_front = int(np.round((int(timestamps[0] - recording_start) / 1e9) * sr_rounded)) 
+        pad_back = self.getNSamples()[idx] - pad_front - len(signal)
+
+        signal = np.concatenate([np.zeros((pad_front)), signal, np.zeros((pad_back))])
+        if not digital:
+            scale = self.getSignalHeader(idx)['scale']
+            offset = self.getSignalHeader(idx)['offset']
+            signal = scale * signal + offset
+
+        # Manual preprocessing to get rid of strong outliers
+        if self.getSignalHeader(idx)['unit'] == 'bpm': 
+            max_value = 200
+            signal[np.where(signal >= max_value)] = np.nan
+            signal = pd.DataFrame(signal).ffill().to_numpy().squeeze()
+
+        if n is None:
+            end = None 
+        else:
+            end = start + n
+
+        return signal[start:end]
 
