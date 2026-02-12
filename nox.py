@@ -125,7 +125,10 @@ class NoxReader:
 
     def _parse_ndf_header(self, path):
         header = {}
-        data_locs = []
+        data_chunks = {
+            'filepath': path,
+            'chunk_information': [],
+        }
         with open(path, 'rb') as f:
             magic = f.read(4) 
             assert magic == b'NOX\x03'
@@ -151,8 +154,12 @@ class NoxReader:
                     # Get Hash
                     hash_ = ''.join([chr(read_uint16(f)) for _ in range(length//2)])
                     header['hash'] = hash_
+                elif typ == 144:
+                    # Set global sampling rate
+                    sampling_rate = read_double(f)
+                    header['samplingrate'] = float(sampling_rate)
                 elif typ == 512:
-                    # Start time
+                    # Start time of chunk
                     d = ''.join([chr(read_uint16(f)) for _ in range(length//2)])
                     if length == 36:
                         print('Start time length not correct. TODO')
@@ -161,20 +168,36 @@ class NoxReader:
                         start_time = datetime.strptime(d, '%Y%m%dT%H%M%S.%f')
 
                     start_time = np.datetime64(start_time, 'ns')
-                    header['start_time'] = start_time
-                elif typ == 514 or typ == 144:
-                    sampling_rate = read_double(f)
-                    header['samplingrate'] = float(sampling_rate)
+                    if 'start_time' not in header:
+                        # First time, save for later
+                        header['start_time'] = start_time
+
+                    chunk_info = {'start_time': start_time}
+                    data_chunks['chunk_information'].append(chunk_info)
                 elif typ == 513:
                     # Data blocks
                     fmt = header['format']
-                    data_locs.append([fmt, f.tell(), length, path])
+
+                    current_chunk = data_chunks['chunk_information'][-1]
+                    current_chunk['start_position'] = f.tell()
+                    current_chunk['length'] = length
+                    current_chunk['fmt'] = fmt
+                    data_chunks['chunk_information'][-1] = current_chunk
+
+                    # Done here, skip forward
                     f.seek(length, 1)
                     continue
+                elif typ == 514:
+                    sampling_rate = read_double(f)
+                    header['samplingrate'] = float(sampling_rate)
+
+                    current_chunk = data_chunks['chunk_information'][-1]
+                    current_chunk['samplingrate'] = sampling_rate
+                    data_chunks['chunk_information'][-1] = current_chunk
                 else:
                     raise NotImplementedError('Unknown code', typ, 'with length', length)
 
-        return header, data_locs
+        return header, data_chunks
 
     def _read_channel_headers(self):
         channel_paths = list(self.path.glob('*.ndf'))
@@ -220,33 +243,53 @@ class NoxReader:
 
     def readSignal(self, idx, start=0, n=None, digital=False):
 
-        loc = self.channel_data_locations[idx]
-        if len(loc) > 1:
-            raise NotImplementedError('Channel', idx, 'has gaps. Not yet implemented')
-        fmt, tell, length, filepath = loc[0]
+        data_chunks = self.channel_data_locations[idx]
+        filepath = data_chunks['filepath']
 
         # Actually get the data now
+        signal = []
         with open(filepath, 'rb') as f:
-            f.seek(tell, 0)
-            if fmt == 'Int16':
-                signal = np.frombuffer(f.read(length), dtype=np.int16)
-            elif fmt == 'Int32':
-                signal = np.frombuffer(f.read(length), dtype=np.int32)
-            else:
-                raise NotImplementedError('Unknown data format', fmt)
+            for chunk_info in data_chunks['chunk_information']:
+                fmt = chunk_info['fmt']
+                tell = chunk_info['start_position']
+                length = chunk_info['length']
+                start_time = chunk_info['start_time']
+                sr = chunk_info['samplingrate']
+
+                f.seek(tell, 0)
+                if fmt == 'Int16':
+                    _signal = np.frombuffer(f.read(length), dtype=np.int16)
+                elif fmt == 'Int32':
+                    _signal = np.frombuffer(f.read(length), dtype=np.int32)
+                else:
+                    raise NotImplementedError('Unknown data format', fmt)
+
+                # Create corresponding timestamps
+                timestamps = pd.date_range(start=start_time, periods=len(_signal), freq=pd.to_timedelta(1/sr, unit='s'))
+
+                # Resample
+                sr_rounded = float(round(self.getSignalHeader(idx)['samplingrate'])) # Just in case they are different between chunks
+                s = pd.Series(_signal, index=timestamps).resample(f'{1/sr_rounded}s').mean()
+
+                signal.append(s)
+
+        if len(signal) > 1:
+            series_start = signal[0].index[0]
+            series_end = signal[-1].index[-1]
+            freq = signal[0].index.freq # They are equal after resampling anyway
+            timestamps = pd.date_range(start=series_start, end=series_end, freq=freq)
+            signal = pd.concat(signal).reindex(timestamps).ffill()
+        else:
+            # TODO: Maybe this condition is not needed. But I'm not sure about the idempotency of timestamp magic right now
+            signal = signal[0]
+            timestamps = signal.index
+            signal = signal.to_numpy().squeeze()
 
         recording_start = self.getStartdatetime()
-        sr = self.getSampleFrequency(idx)
-        timestamps = pd.date_range(start=self.getSignalHeader(idx)['start_time'], periods=len(signal), freq=pd.to_timedelta(1/sr, unit='s'))
-
-        sr_rounded = float(round(sr))
-        s = pd.Series(signal, index=timestamps).resample(f'{1/sr_rounded}s').mean()
-        timestamps = s.index.to_numpy().squeeze()
-        signal = s.to_numpy().squeeze()
 
         # TODO: Still not 100%. Sometimes off by 1, sometimes by -1, sometimes 2 
         #       Good enough for now
-        pad_front = int(np.round((int(timestamps[0] - recording_start) / 1e9) * sr_rounded)) 
+        pad_front = int(np.round((int(timestamps[0].to_numpy() - recording_start) / 1e9) * sr_rounded)) 
         pad_back = self.getNSamples()[idx] - pad_front - len(signal)
 
         signal = np.concatenate([np.zeros((pad_front)), signal, np.zeros((pad_back))])
@@ -267,4 +310,3 @@ class NoxReader:
             end = start + n
 
         return signal[start:end]
-
