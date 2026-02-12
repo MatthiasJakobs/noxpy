@@ -41,6 +41,10 @@ def mu2lin(mu_bytes):
 
     return pcm.astype(np.int16)
 
+# .NET ticks (microseconds / 10, starting from 01.01.0001)
+def ticks_to_datetime(ticks):
+    return np.datetime64('0001-01-01') + np.timedelta64(int(ticks) // 10, 'us')
+
 def header_xml_to_dict(header_xml):
 
     def parse_properties(prop):
@@ -242,7 +246,6 @@ class NoxReader:
         return [_getNSamples(idx) for idx in range(self.n_channels)]
 
     def readSignal(self, idx, start=0, n=None, digital=False):
-
         data_chunks = self.channel_data_locations[idx]
         filepath = data_chunks['filepath']
 
@@ -310,3 +313,79 @@ class NoxReader:
             end = start + n
 
         return signal[start:end]
+
+    def getAnnotations(self, return_manual_corrections=True):
+
+        def _apply_corrections(df_base, df_corr):
+            df_base = df_base.copy()
+            df_corr = df_corr.copy()
+
+            key_cols = ['start', 'end']
+
+            base_idx = pd.MultiIndex.from_frame(df_base[key_cols])
+            corr_idx = pd.MultiIndex.from_frame(df_corr[key_cols])
+
+            # split corrections
+            corr_delete = df_corr[df_corr['is_deleted']]
+            corr_update = df_corr[~df_corr['is_deleted']]
+
+            # --- 1. delete rows ---
+            if not corr_delete.empty:
+                delete_idx = pd.MultiIndex.from_frame(corr_delete[key_cols])
+                keep_mask = ~base_idx.isin(delete_idx)
+                df_base = df_base.loc[keep_mask].reset_index(drop=True)
+                base_idx = pd.MultiIndex.from_frame(df_base[key_cols])
+
+            # --- 2. update existing rows ---
+            if not corr_update.empty:
+                corr_map = corr_update.set_index(key_cols)['label']
+
+                common = base_idx.intersection(corr_map.index)
+                if len(common) > 0:
+                    mask = base_idx.isin(common)
+                    df_base.loc[mask, 'label'] = [
+                        corr_map.loc[key] for key in base_idx[mask]
+                    ]
+
+                # --- 3. add new rows ---
+                new_mask = ~corr_idx.isin(base_idx) & ~df_corr['is_deleted']
+                if new_mask.any():
+                    df_base = pd.concat(
+                        [df_base, df_corr.loc[new_mask].drop(columns='is_deleted')],
+                        ignore_index=True
+                    )
+
+            # --- 4. sort ---
+            df_base = df_base.sort_values('start').reset_index(drop=True)
+
+            return df_base
+
+        db_file = self.path.joinpath('Data.ndb')
+        con = sqlite3.connect(db_file)
+        cur = con.cursor()
+
+        # Get automatic annotations first
+        query = 'SELECT t1.starts_at AS start, t1.ends_at AS end, t1.type AS label FROM temporary_scoring_marker t1 JOIN temporary_scoring_key t2 ON t1.key_id = t2.id WHERE t2.type = "Automatic"'
+        df = pd.read_sql_query(query, con)
+
+        df['start'] = pd.to_datetime(df['start'].map(ticks_to_datetime))
+        df['end'] = pd.to_datetime(df['end'].map(ticks_to_datetime))
+        df = df.sort_values('start').drop_duplicates().reset_index(drop=True)
+
+        if not return_manual_corrections:
+            return df
+
+        # Iterate through manual annotations
+        res = cur.execute('SELECT id FROM temporary_scoring_key WHERE type = "Manual" ORDER BY id;').fetchall()
+        for (manual_id,) in res:
+            query = f'SELECT starts_at AS start, ends_at AS end, type AS label, is_deleted FROM temporary_scoring_marker WHERE key_id = {manual_id};'
+            correction = pd.read_sql_query(query, con)
+            correction['start'] = pd.to_datetime(correction['start'].map(ticks_to_datetime))
+            correction['end'] = pd.to_datetime(correction['end'].map(ticks_to_datetime))
+            correction['is_deleted'] = correction['is_deleted'].astype(bool)
+            correction = correction.sort_values('start').drop_duplicates().reset_index(drop=True)
+
+            df = _apply_corrections(df, correction).drop_duplicates()
+
+        return df
+
