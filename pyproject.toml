@@ -1,0 +1,26 @@
+[build-system]
+requires = ['setuptools>=68.0']
+build-backend = 'setuptools.build_meta'
+
+[project]
+name = 'noxpy'
+version = '0.1.0'
+description = 'Read raw PSG data and annotations from Noxturnal sleep recordings'
+readme = 'README.md'
+requires-python = '>=3.9'
+license = {file = 'LICENSE'}
+authors = [
+    {name = 'Matthias Jakobs', email = 'matthias.jakobs@rlk.uk-essen.de'}
+]
+
+dependencies = [
+    'numpy',
+    'pandas'
+]
+
+[tool.setuptools]
+package-dir = {'' = 'src'}
+
+[tool.setuptools.packages.find]
+where = ['src']
+
