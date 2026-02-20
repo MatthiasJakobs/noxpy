@@ -323,11 +323,10 @@ class NoxReader:
             key_cols = ['start', 'end']
 
             base_idx = pd.MultiIndex.from_frame(df_base[key_cols])
-            corr_idx = pd.MultiIndex.from_frame(df_corr[key_cols])
 
             # split corrections
-            corr_delete = df_corr[df_corr['is_deleted']]
-            corr_update = df_corr[~df_corr['is_deleted']]
+            corr_delete = df_corr[df_corr['is_deleted']].drop(columns=['is_deleted'])
+            corr_update = df_corr[~df_corr['is_deleted']].drop(columns=['is_deleted'])
 
             # --- 1. delete rows ---
             if not corr_delete.empty:
@@ -338,25 +337,52 @@ class NoxReader:
 
             # --- 2. update existing rows ---
             if not corr_update.empty:
-                corr_map = corr_update.set_index(key_cols)['label']
+                df_base = df_base.reset_index(drop=False).rename(columns={'index': 'base_id'})
+                corr_update = corr_update.reset_index(drop=False).rename(columns={'index': 'corr_id'})
 
-                common = base_idx.intersection(corr_map.index)
-                if len(common) > 0:
-                    mask = base_idx.isin(common)
-                    df_base.loc[mask, 'label'] = [
-                        corr_map.loc[key] for key in base_idx[mask]
-                    ]
+                # --- Rule 1: Same start, same label, different end ---
+                r1 = corr_update.merge(
+                    df_base,
+                    on=['start', 'label'],
+                    how='inner',
+                    suffixes=('_corr', '_base')
+                )
 
-                # --- 3. add new rows ---
-                new_mask = ~corr_idx.isin(base_idx) & ~df_corr['is_deleted']
-                if new_mask.any():
-                    df_base = pd.concat(
-                        [df_base, df_corr.loc[new_mask].drop(columns='is_deleted')],
-                        ignore_index=True
-                    )
+                r1 = r1[r1['end_corr'] != r1['end_base']]
+                df_base.loc[df_base['base_id'].isin(r1['base_id']), 'end'] = (r1.drop_duplicates('base_id').set_index('base_id')['end_corr'])
+                used_corr_ids = set(r1['corr_id'])
+                corr_remaining = corr_update[~corr_update['corr_id'].isin(used_corr_ids)]
 
-            # --- 4. sort ---
-            df_base = df_base.sort_values('start').reset_index(drop=True)
+                # --- Rule 2: Same start, same end, different label ---
+                r2 = corr_remaining.merge(
+                    df_base,
+                    on=['start', 'end'],
+                    how='inner',
+                    suffixes=('_corr', '_base')
+                )
+
+                r2 = r2[r2['label_corr'] != r2['label_base']]
+                df_base.loc[df_base['base_id'].isin(r2['base_id']), 'label'] = (r2.drop_duplicates('base_id').set_index('base_id')['label_corr'])
+                used_corr_ids |= set(r2['corr_id'])
+                corr_remaining = corr_remaining[~corr_remaining['corr_id'].isin(used_corr_ids)]
+
+                # --- Rule 3: Same end, same label, different start ---
+                r3 = corr_remaining.merge(
+                    df_base,
+                    on=['end', 'label'],
+                    how='inner',
+                    suffixes=('_corr', '_base')
+                )
+
+                r3 = r3[r3['start_corr'] != r3['start_base']]
+                df_base.loc[df_base['base_id'].isin(r3['base_id']), 'start'] = (r3.drop_duplicates('base_id').set_index('base_id')['start_corr'])
+                used_corr_ids |= set(r3['corr_id'])
+                corr_remaining = corr_remaining[~corr_remaining['corr_id'].isin(used_corr_ids)]
+
+                # Append unmatched corrections
+                df_base = pd.concat([df_base.drop(columns='base_id'), corr_remaining.drop(columns='corr_id')], ignore_index=True )
+
+            df_base = df_base.sort_values('start').drop_duplicates().reset_index(drop=True)
 
             return df_base
 
@@ -387,5 +413,9 @@ class NoxReader:
 
             df = _apply_corrections(df, correction).drop_duplicates()
 
-        return df
+        # Crop annotations to fit inside the recording time
+        record_start = self.getStartdatetime()
+        record_stop = record_start + np.timedelta64(int(self.getFileDuration()), 's')
+        df = df[(df['start'] >= record_start) & (df['start'] <= record_stop)].reset_index(drop=True)
 
+        return df
