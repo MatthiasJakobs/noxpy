@@ -419,3 +419,15 @@ class NoxReader:
         df = df[(df['start'] >= record_start) & (df['start'] <= record_stop)].reset_index(drop=True)
 
         return df
+
+    def getPatientCode(self):
+        return self._subject_info.get('ID', '')
+
+    def getPatientName(self):
+        first_name = self._subject_info.get('FirstName', '')
+        middle_name = self._subject_info.get('MiddleName', '')
+        last_name = self._subject_info.get('LastName', '')
+        return ' '.join(f'{first_name} {middle_name} {last_name}'.split())
+
+    def getPatientAdditional(self):
+        return self._subject_info.copy()
