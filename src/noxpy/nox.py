@@ -264,6 +264,10 @@ class NoxReader:
                     _signal = np.frombuffer(f.read(length), dtype=np.int16)
                 elif fmt == 'Int32':
                     _signal = np.frombuffer(f.read(length), dtype=np.int32)
+                elif fmt == 'UInt32':
+                    _signal = np.frombuffer(f.read(length), dtype=np.uint32)
+                elif fmt == 'Byte':
+                    _signal = np.frombuffer(f.read(length), dtype=np.uint8)
                 else:
                     raise NotImplementedError('Unknown data format', fmt)
 
@@ -272,7 +276,8 @@ class NoxReader:
 
                 # Resample
                 sr_rounded = float(round(self.getSignalHeader(idx)['samplingrate'])) # Just in case they are different between chunks
-                s = pd.Series(_signal, index=timestamps).resample(f'{1/sr_rounded}s').mean()
+                period_ns = round(1_000_000_000 / sr_rounded)
+                s = pd.Series(_signal, index=timestamps).resample(f'{period_ns}ns').mean().ffill()
 
                 signal.append(s)
 
@@ -304,6 +309,11 @@ class NoxReader:
         # Manual preprocessing to get rid of strong outliers
         if self.getSignalHeader(idx)['unit'] == 'bpm': 
             max_value = 200
+            signal[np.where(signal >= max_value)] = np.nan
+            signal = pd.DataFrame(signal).ffill().to_numpy().squeeze()
+
+        if self.getSignalHeader(idx)['unit'] == '%': 
+            max_value = 100
             signal[np.where(signal >= max_value)] = np.nan
             signal = pd.DataFrame(signal).ffill().to_numpy().squeeze()
 
