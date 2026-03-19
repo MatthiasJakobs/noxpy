@@ -1,3 +1,4 @@
+from copy import deepcopy
 import pandas as pd
 import pathlib
 import numpy as np
@@ -82,6 +83,22 @@ def parse_header(f, length):
     header_xml = ET.fromstring(header_raw)
     return header_xml_to_dict(header_xml)
 
+# Noxturnal seems to reference signals by default from raw data.
+# We model this here by doing the referencing manually
+COMPOSITE_CHANNELS = {
+    'AF3-E3E4': {'main': 'AF3', 'type': 'EEG-AF3-E3E4', 'refs': ['E3', 'E4']},
+    'AF4-E3E4': {'main': 'AF4', 'type': 'EEG-AF4-E3E4', 'refs': ['E3', 'E4']},
+    'AF7-E3E4': {'main': 'AF7', 'type': 'EEG-AF7-E3E4', 'refs': ['E3', 'E4']},
+    'AF8-E3E4': {'main': 'AF8', 'type': 'EEG-AF8-E3E4', 'refs': ['E3', 'E4']},
+    'E1-E4': {'main': 'E1', 'type': 'EOG-E1-E4', 'refs': ['E4']},
+    'E2-AFZ': {'main': 'E2', 'type': 'EOG-E2-AFZ', 'refs': ['AFZ']},
+    'E2-E3': {'main': 'E2', 'type': 'EOG-E2-E3', 'refs': ['E3']},
+    'E3-AFZ': {'main': 'E3', 'type': 'EOG-E3-AFZ', 'refs': ['AFZ']},
+    'LA-RA': {'main': 'EKG LA', 'type': 'EKG-LA-RA', 'refs': ['EKG RA']},
+    'LF-LA': {'main': 'EKG LF', 'type': 'EKG-LF-LA', 'refs': ['EKG LA']},
+    'LF-RA': {'main': 'EKG LF', 'type': 'EKG-LF-RA', 'refs': ['EKG RA']},
+}
+
 class NoxReader:
 
     def __init__(self, path):
@@ -91,6 +108,21 @@ class NoxReader:
 
         self._read_channel_headers()
         self._load_recording_metadata()
+
+        # Check if composite channels are present
+        channel_labels = [c['label'] for _, c in self.channel_headers.items()]
+        for cchannel_name, d in COMPOSITE_CHANNELS.items():
+            main = d['main']
+            refs = d['refs']
+            t = d['type']
+            if main in channel_labels and all([r in channel_labels for r in refs]):
+                header = deepcopy(self.channel_headers[channel_labels.index(main)])
+                header['label'] = cchannel_name
+                header['type'] = t
+                del header['hash']
+                idx = self.n_channels
+                self.channel_headers[idx] = header
+                self.n_channels += 1
 
     def _load_recording_metadata(self):
         db_file = self.path.joinpath('Data.ndb')
@@ -246,6 +278,18 @@ class NoxReader:
         return [_getNSamples(idx) for idx in range(self.n_channels)]
 
     def readSignal(self, idx, start=0, n=None, digital=False):
+        label = self.getSignalLabels()[idx]
+        if label in COMPOSITE_CHANNELS:
+            # Compute composite channels
+            main = COMPOSITE_CHANNELS[label]['main']
+            refs = COMPOSITE_CHANNELS[label]['refs']
+            ref_indcs = [self.getSignalLabels().index(r) for r in refs]
+            main_idx = self.getSignalLabels().index(main)
+            main_signal = self.readSignal(main_idx, start=start, n=n, digital=digital)
+            ref_signals = [self.readSignal(r_idx, start=start, n=n, digital=digital) for r_idx in ref_indcs]
+            ref_signal = np.stack(ref_signals, 1).mean(1)
+            return main_signal - ref_signal
+            
         data_chunks = self.channel_data_locations[idx]
         filepath = data_chunks['filepath']
 
