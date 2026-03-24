@@ -86,13 +86,21 @@ def parse_header(f, length):
 # Noxturnal seems to reference signals by default from raw data.
 # We model this here by doing the referencing manually
 COMPOSITE_CHANNELS = {
+    'C3-M2': {'main': 'C3', 'type': 'EEG-C3-M2', 'refs': ['M2']},
+    'F3-M2': {'main': 'F3', 'type': 'EEG-F3-M2', 'refs': ['M2']},
+    'O1-M2': {'main': 'O1', 'type': 'EEG-O1-M2', 'refs': ['M2']},
+    'C4-M1': {'main': 'C4', 'type': 'EEG-C4-M1', 'refs': ['M1']},
+    'F4-M1': {'main': 'F4', 'type': 'EEG-F4-M1', 'refs': ['M1']},
+    'O2-M1': {'main': 'O2', 'type': 'EEG-O2-M1', 'refs': ['M1']},
     'AF3-E3E4': {'main': 'AF3', 'type': 'EEG-AF3-E3E4', 'refs': ['E3', 'E4']},
     'AF4-E3E4': {'main': 'AF4', 'type': 'EEG-AF4-E3E4', 'refs': ['E3', 'E4']},
     'AF7-E3E4': {'main': 'AF7', 'type': 'EEG-AF7-E3E4', 'refs': ['E3', 'E4']},
     'AF8-E3E4': {'main': 'AF8', 'type': 'EEG-AF8-E3E4', 'refs': ['E3', 'E4']},
     'E1-E4': {'main': 'E1', 'type': 'EOG-E1-E4', 'refs': ['E4']},
+    'E1-M2': {'main': 'E1', 'type': 'EOG-E1-M2', 'refs': ['M2']},
     'E2-AFZ': {'main': 'E2', 'type': 'EOG-E2-AFZ', 'refs': ['AFZ']},
     'E2-E3': {'main': 'E2', 'type': 'EOG-E2-E3', 'refs': ['E3']},
+    'E2-M1': {'main': 'E2', 'type': 'EOG-E2-M1', 'refs': ['M1']},
     'E3-AFZ': {'main': 'E3', 'type': 'EOG-E3-AFZ', 'refs': ['AFZ']},
     'LA-RA': {'main': 'EKG LA', 'type': 'EKG-LA-RA', 'refs': ['EKG RA']},
     'LF-LA': {'main': 'EKG LF', 'type': 'EKG-LF-LA', 'refs': ['EKG LA']},
