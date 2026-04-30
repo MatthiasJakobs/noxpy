@@ -349,7 +349,7 @@ class NoxReader:
 
         # TODO: Still not 100%. Sometimes off by 1, sometimes by -1, sometimes 2 
         #       Good enough for now
-        pad_front = int(np.round((int(timestamps[0].to_numpy() - recording_start) / 1e9) * sr_rounded)) 
+        pad_front = max(0, int(np.round((int(timestamps[0].to_numpy() - recording_start) / 1e9) * sr_rounded)))
         pad_back = self.getNSamples()[idx] - pad_front - len(signal)
 
         signal = np.concatenate([np.zeros((pad_front)), signal, np.zeros((pad_back))])
@@ -452,8 +452,18 @@ class NoxReader:
         con = sqlite3.connect(db_file)
         cur = con.cursor()
 
+        # Get scoring marker table name
+        try:
+            query = 'SELECT * FROM temporary_scoring_marker LIMIT 1'
+            _ = pd.read_sql_query(query, con)
+            marker_table_name = 'temporary_scoring_marker'
+            key_table_name = 'temporary_scoring_key'
+        except pd.errors.DatabaseError:
+            marker_table_name = 'scoring_marker'
+            key_table_name = 'scoring_key'
+
         # Get automatic annotations first
-        query = 'SELECT t1.starts_at AS start, t1.ends_at AS end, t1.type AS label FROM temporary_scoring_marker t1 JOIN temporary_scoring_key t2 ON t1.key_id = t2.id WHERE t2.type = "Automatic"'
+        query = f'SELECT t1.starts_at AS start, t1.ends_at AS end, t1.type AS label FROM {marker_table_name} t1 JOIN {key_table_name} t2 ON t1.key_id = t2.id WHERE t2.type = "Automatic"'
         df = pd.read_sql_query(query, con)
 
         df['start'] = pd.to_datetime(df['start'].map(ticks_to_datetime))
@@ -464,9 +474,9 @@ class NoxReader:
             return df
 
         # Iterate through manual annotations
-        res = cur.execute('SELECT id FROM temporary_scoring_key WHERE type = "Manual" ORDER BY id;').fetchall()
+        res = cur.execute(f'SELECT id FROM {key_table_name} WHERE type = "Manual" ORDER BY id;').fetchall()
         for (manual_id,) in res:
-            query = f'SELECT starts_at AS start, ends_at AS end, type AS label, is_deleted FROM temporary_scoring_marker WHERE key_id = {manual_id};'
+            query = f'SELECT starts_at AS start, ends_at AS end, type AS label, is_deleted FROM {marker_table_name} WHERE key_id = {manual_id};'
             correction = pd.read_sql_query(query, con)
             correction['start'] = pd.to_datetime(correction['start'].map(ticks_to_datetime))
             correction['end'] = pd.to_datetime(correction['end'].map(ticks_to_datetime))
