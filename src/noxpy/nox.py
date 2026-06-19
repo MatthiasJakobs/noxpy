@@ -77,8 +77,7 @@ def header_xml_to_dict(header_xml):
 
 def parse_header(f, length):
     # Read header. Its XML. Filter out trailing zeros.
-    header_raw_bytes = [read_uint16(f) for _ in range(length//2)]
-    header_raw = ''.join([chr(b) for b in header_raw_bytes if b != 0])
+    header_raw = f.read(length).decode('utf-16-le').replace('\x00', '')
     header_raw = header_raw.replace('°', 'Angle') # Probably important for further parsing the XML? 
     header_xml = ET.fromstring(header_raw)
     return header_xml_to_dict(header_xml)
@@ -113,9 +112,9 @@ class NoxReader:
         self.path = pathlib.Path(path)
         self.channel_headers = {}
         self.channel_data_locations = {}
+        self._metadata_loaded = False
 
         self._read_channel_headers()
-        self._load_recording_metadata()
 
         # Check if composite channels are present
         channel_labels = [c['label'] for _, c in self.channel_headers.items()]
@@ -134,8 +133,6 @@ class NoxReader:
 
     def _load_recording_metadata(self):
         db_file = self.path.joinpath('Data.ndb')
-        con = sqlite3.connect(db_file)
-        cur = con.cursor()
 
         # Initialize raw data dicts
         self._recording_info = {}
@@ -143,7 +140,11 @@ class NoxReader:
         self._device_info = {}
         self._technician_info = {}
 
-        res = cur.execute('SELECT key, type, value, name FROM internal_property;').fetchall()
+        with sqlite3.connect(db_file) as con:
+            res = con.execute(
+                'SELECT key, type, value, name FROM internal_property;'
+            ).fetchall()
+
         for (key, datatype, value, name) in res:
             if datatype == 'Long':
                 value = int(value)
@@ -167,6 +168,12 @@ class NoxReader:
             elif name == 'TechnicianInfo':
                 self._technician_info[key] = value
 
+        self._metadata_loaded = True
+
+    def _ensure_recording_metadata(self):
+        if not self._metadata_loaded:
+            self._load_recording_metadata()
+
     def _parse_ndf_header(self, path):
         header = {}
         data_chunks = {
@@ -177,15 +184,11 @@ class NoxReader:
             magic = f.read(4) 
             assert magic == b'NOX\x03'
 
-            while True:
-                current_position = f.tell()
-                f.seek(0, 2)  # Move to end
-                file_size = f.tell()
-                f.seek(current_position)  # Move back
+            f.seek(0, 2)
+            file_size = f.tell()
+            f.seek(4)
 
-                if current_position == file_size:
-                    break
-
+            while f.tell() < file_size:
                 # Read block and determine action
                 typ = read_uint16(f)
                 length = read_uint32(f)
@@ -196,7 +199,7 @@ class NoxReader:
                     header = ndf_header
                 elif typ == 1:
                     # Get Hash
-                    hash_ = ''.join([chr(read_uint16(f)) for _ in range(length//2)])
+                    hash_ = f.read(length).decode('utf-16-le').replace('\x00', '')
                     header['hash'] = hash_
                 elif typ == 144:
                     # Set global sampling rate
@@ -204,7 +207,7 @@ class NoxReader:
                     header['samplingrate'] = float(sampling_rate)
                 elif typ == 512:
                     # Start time of chunk
-                    d = ''.join([chr(read_uint16(f)) for _ in range(length//2)])
+                    d = f.read(length).decode('utf-16-le').replace('\x00', '')
                     if length == 36:
                         print('Start time length not correct. TODO')
                         start_time = datetime.strptime(d, '%Y%m%dT%H%M%S')
@@ -261,9 +264,11 @@ class NoxReader:
         return [head['label'] for head in self.getSignalHeaders()]
 
     def getStartdatetime(self):
+        self._ensure_recording_metadata()
         return self._recording_info['RecordingStart']
 
     def getFileDuration(self, datarecord_duration=10.0):
+        self._ensure_recording_metadata()
         # Compatibility with EDF files: Assume a fixed block size for each data record and round accordingly
         rec_start = self._recording_info['RecordingStart']
         rec_stop = self._recording_info['RecordingStop']
@@ -493,13 +498,16 @@ class NoxReader:
         return df
 
     def getPatientCode(self):
+        self._ensure_recording_metadata()
         return self._subject_info.get('ID', '')
 
     def getPatientName(self):
+        self._ensure_recording_metadata()
         first_name = self._subject_info.get('FirstName', '')
         middle_name = self._subject_info.get('MiddleName', '')
         last_name = self._subject_info.get('LastName', '')
         return ' '.join(f'{first_name} {middle_name} {last_name}'.split())
 
     def getPatientAdditional(self):
+        self._ensure_recording_metadata()
         return self._subject_info.copy()
