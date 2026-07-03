@@ -8,3 +8,4 @@ test.png
 *.xml
 *.XML
 __pycache__
+*.egg-info
