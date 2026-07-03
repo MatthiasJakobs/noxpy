@@ -104,6 +104,8 @@ COMPOSITE_CHANNELS = {
     'LA-RA': {'main': 'EKG LA', 'type': 'EKG-LA-RA', 'refs': ['EKG RA']},
     'LF-LA': {'main': 'EKG LF', 'type': 'EKG-LF-LA', 'refs': ['EKG LA']},
     'LF-RA': {'main': 'EKG LF', 'type': 'EKG-LF-RA', 'refs': ['EKG RA']},
+    '1-F': {'main': '1', 'type': '1', 'refs': ['F']},
+    '2-F': {'main': '2', 'type': '2', 'refs': ['F']},
 }
 
 class NoxReader:
@@ -248,11 +250,17 @@ class NoxReader:
 
     def _read_channel_headers(self):
         channel_paths = list(self.path.glob('*.ndf'))
-        for i, channel_path in enumerate(channel_paths):
+        i = 0
+        for channel_path in channel_paths:
             channel_header, channel_data_location = self._parse_ndf_header(channel_path)
+            total_channel_length = sum([cd['length'] for cd in channel_data_location['chunk_information']])
+            if total_channel_length <= 0:
+                # Sometimes there is only one block of length zero -> skip the channel (pretend it does not exist)
+                continue
             self.channel_headers[i] = channel_header
             self.channel_data_locations[i] = channel_data_location
-        self.n_channels = len(channel_paths)
+            i += 1
+        self.n_channels = len(self.channel_headers)
 
     def getSignalHeader(self, idx):
         return self.channel_headers[idx]
@@ -343,7 +351,7 @@ class NoxReader:
             series_end = signal[-1].index[-1]
             freq = signal[0].index.freq # They are equal after resampling anyway
             timestamps = pd.date_range(start=series_start, end=series_end, freq=freq)
-            signal = pd.concat(signal).reindex(timestamps).ffill()
+            signal = pd.concat(signal).groupby(level=0).mean().reindex(timestamps).ffill()
         else:
             # TODO: Maybe this condition is not needed. But I'm not sure about the idempotency of timestamp magic right now
             signal = signal[0]
@@ -354,7 +362,7 @@ class NoxReader:
 
         # TODO: Still not 100%. Sometimes off by 1, sometimes by -1, sometimes 2 
         #       Good enough for now
-        pad_front = max(0, int(np.round((int(timestamps[0].to_numpy() - recording_start) / 1e9) * sr_rounded)))
+        pad_front = max(int(np.round((int(timestamps[0].to_numpy() - recording_start) / 1e9) * sr_rounded)), 0)
         pad_back = self.getNSamples()[idx] - pad_front - len(signal)
 
         signal = np.concatenate([np.zeros((pad_front)), signal, np.zeros((pad_back))])
@@ -457,18 +465,8 @@ class NoxReader:
         con = sqlite3.connect(db_file)
         cur = con.cursor()
 
-        # Get scoring marker table name
-        try:
-            query = 'SELECT * FROM temporary_scoring_marker LIMIT 1'
-            _ = pd.read_sql_query(query, con)
-            marker_table_name = 'temporary_scoring_marker'
-            key_table_name = 'temporary_scoring_key'
-        except pd.errors.DatabaseError:
-            marker_table_name = 'scoring_marker'
-            key_table_name = 'scoring_key'
-
         # Get automatic annotations first
-        query = f'SELECT t1.starts_at AS start, t1.ends_at AS end, t1.type AS label FROM {marker_table_name} t1 JOIN {key_table_name} t2 ON t1.key_id = t2.id WHERE t2.type = "Automatic"'
+        query = 'SELECT t1.starts_at AS start, t1.ends_at AS end, t1.type AS label FROM temporary_scoring_marker t1 JOIN temporary_scoring_key t2 ON t1.key_id = t2.id WHERE t2.type = "Automatic"'
         df = pd.read_sql_query(query, con)
 
         df['start'] = pd.to_datetime(df['start'].map(ticks_to_datetime))
@@ -479,9 +477,9 @@ class NoxReader:
             return df
 
         # Iterate through manual annotations
-        res = cur.execute(f'SELECT id FROM {key_table_name} WHERE type = "Manual" ORDER BY id;').fetchall()
+        res = cur.execute('SELECT id FROM temporary_scoring_key WHERE type = "Manual" ORDER BY id;').fetchall()
         for (manual_id,) in res:
-            query = f'SELECT starts_at AS start, ends_at AS end, type AS label, is_deleted FROM {marker_table_name} WHERE key_id = {manual_id};'
+            query = f'SELECT starts_at AS start, ends_at AS end, type AS label, is_deleted FROM temporary_scoring_marker WHERE key_id = {manual_id};'
             correction = pd.read_sql_query(query, con)
             correction['start'] = pd.to_datetime(correction['start'].map(ticks_to_datetime))
             correction['end'] = pd.to_datetime(correction['end'].map(ticks_to_datetime))
