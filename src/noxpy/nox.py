@@ -114,24 +114,9 @@ class NoxReader:
         self.path = pathlib.Path(path)
         self.channel_headers = {}
         self.channel_data_locations = {}
+        self.n_channels = 0
+        self._channel_headers_loaded = False
         self._metadata_loaded = False
-
-        self._read_channel_headers()
-
-        # Check if composite channels are present
-        channel_labels = [c['label'] for _, c in self.channel_headers.items()]
-        for cchannel_name, d in COMPOSITE_CHANNELS.items():
-            main = d['main']
-            refs = d['refs']
-            t = d['type']
-            if main in channel_labels and all([r in channel_labels for r in refs]):
-                header = deepcopy(self.channel_headers[channel_labels.index(main)])
-                header['label'] = cchannel_name
-                header['type'] = t
-                del header['hash']
-                idx = self.n_channels
-                self.channel_headers[idx] = header
-                self.n_channels += 1
 
     def _load_recording_metadata(self):
         db_file = self.path.joinpath('Data.ndb')
@@ -262,6 +247,27 @@ class NoxReader:
             i += 1
         self.n_channels = len(self.channel_headers)
 
+        # Check if composite channels are present
+        channel_labels = [c['label'] for _, c in self.channel_headers.items()]
+        for cchannel_name, d in COMPOSITE_CHANNELS.items():
+            main = d['main']
+            refs = d['refs']
+            t = d['type']
+            if main in channel_labels and all([r in channel_labels for r in refs]):
+                header = deepcopy(self.channel_headers[channel_labels.index(main)])
+                header['label'] = cchannel_name
+                header['type'] = t
+                del header['hash']
+                idx = self.n_channels
+                self.channel_headers[idx] = header
+                self.n_channels += 1
+
+        self._channel_headers_loaded = True
+
+    def _ensure_channel_headers(self):
+        if not self._channel_headers_loaded:
+            self._read_channel_headers()
+
     def isASV(self):
         device_events_file = self.path.joinpath('DeviceEvents.nef')
         if not device_events_file.exists():
@@ -297,12 +303,15 @@ class NoxReader:
             connection.close()
 
     def getSignalHeader(self, idx):
+        self._ensure_channel_headers()
         return self.channel_headers[idx]
 
     def getSignalHeaders(self):
+        self._ensure_channel_headers()
         return list(self.channel_headers.values())
 
     def getSignalLabels(self):
+        self._ensure_channel_headers()
         return [head['label'] for head in self.getSignalHeaders()]
 
     def getStartdatetime(self):
@@ -321,9 +330,11 @@ class NoxReader:
         return file_duration
 
     def getSampleFrequency(self, idx):
+        self._ensure_channel_headers()
         return self.channel_headers[idx]['samplingrate']
 
     def getNSamples(self):
+        self._ensure_channel_headers()
         recording_seconds = self.getFileDuration()
 
         def _getNSamples(idx):
@@ -333,6 +344,7 @@ class NoxReader:
         return [_getNSamples(idx) for idx in range(self.n_channels)]
 
     def readSignal(self, idx, start=0, n=None, digital=False):
+        self._ensure_channel_headers()
         label = self.getSignalLabels()[idx]
         if label in COMPOSITE_CHANNELS:
             # Compute composite channels
