@@ -262,6 +262,40 @@ class NoxReader:
             i += 1
         self.n_channels = len(self.channel_headers)
 
+    def isASV(self):
+        device_events_file = self.path.joinpath('DeviceEvents.nef')
+        if not device_events_file.exists():
+            return False
+
+        table_name = 'scoring_marker_property'
+        key = 'TxMode'
+
+        connection = sqlite3.connect(f'{device_events_file.resolve().as_uri()}?mode=ro', uri=True,)
+
+        try:
+            table_exists = connection.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table' AND name = ?
+                """,
+                (table_name,),
+            ).fetchone()
+
+            if table_exists is None:
+                return False
+
+            quoted_table = '"' + table_name.replace('"', '""') + '"'
+
+            row = connection.execute(f'SELECT "value" FROM {quoted_table} WHERE "key" = ? LIMIT 1', (key,),).fetchone()
+            if row is None:
+                return False
+            v = row[0]
+            is_asv = 'asv' in v.lower()
+            return is_asv
+        finally:
+            connection.close()
+
     def getSignalHeader(self, idx):
         return self.channel_headers[idx]
 
