@@ -276,7 +276,7 @@ class NoxReader:
         table_name = 'scoring_marker_property'
         key = 'TxMode'
 
-        connection = sqlite3.connect(f'{device_events_file.resolve().as_uri()}?mode=ro', uri=True,)
+        connection = sqlite3.connect(device_events_file)
 
         try:
             table_exists = connection.execute(
@@ -299,6 +299,10 @@ class NoxReader:
             v = row[0]
             is_asv = 'asv' in v.lower()
             return is_asv
+        except sqlite3.OperationalError:
+            connection.close()
+            print('Operation Error')
+            return False
         finally:
             connection.close()
 
