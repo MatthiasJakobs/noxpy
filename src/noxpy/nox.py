@@ -439,7 +439,9 @@ class NoxReader:
 
         return signal[start:end]
 
-    def getAnnotations(self, return_manual_corrections=True):
+    def getAnnotations(self, returned_annotations='both'):
+        if returned_annotations not in ['both', 'nox', 'manual']:
+            raise NotImplementedError(f'Cannot return annotation type {returned_annotations}. Only supports `both` (for manual corrections of Nox annotations), `nox` for automatic annotations or `manual` for manual annotations')
 
         def _apply_corrections(df_base, df_corr):
             df_base = df_base.copy()
@@ -512,31 +514,49 @@ class NoxReader:
             return df_base
 
         db_file = self.path.joinpath('Data.ndb')
+        if not db_file.exists():
+            print('No database file available for patient', self.path)
+            return pd.DataFrame()
+
         con = sqlite3.connect(db_file)
         cur = con.cursor()
 
-        # Get automatic annotations first
-        query = 'SELECT t1.starts_at AS start, t1.ends_at AS end, t1.type AS label FROM temporary_scoring_marker t1 JOIN temporary_scoring_key t2 ON t1.key_id = t2.id WHERE t2.type = "Automatic"'
-        df = pd.read_sql_query(query, con)
+        df = pd.DataFrame()
+        if returned_annotations in ['both', 'nox']:
+            # Get automatic annotations first
+            query = 'SELECT t1.starts_at AS start, t1.ends_at AS end, t1.type AS label FROM temporary_scoring_marker t1 JOIN temporary_scoring_key t2 ON t1.key_id = t2.id WHERE t2.type = "Automatic"'
+            df_nox = pd.read_sql_query(query, con)
 
-        df['start'] = pd.to_datetime(df['start'].map(ticks_to_datetime))
-        df['end'] = pd.to_datetime(df['end'].map(ticks_to_datetime))
-        df = df.sort_values('start').drop_duplicates().reset_index(drop=True)
+            df_nox['start'] = pd.to_datetime(df_nox['start'].map(ticks_to_datetime))
+            df_nox['end'] = pd.to_datetime(df_nox['end'].map(ticks_to_datetime))
+            df_nox = df_nox.sort_values('start').drop_duplicates().reset_index(drop=True)
 
-        if not return_manual_corrections:
-            return df
+            if returned_annotations == 'nox':
+                return df_nox
+
+            df = df_nox
 
         # Iterate through manual annotations
         res = cur.execute('SELECT id FROM temporary_scoring_key WHERE type = "Manual" ORDER BY id;').fetchall()
-        for (manual_id,) in res:
+        for idx, (manual_id,) in enumerate(res):
             query = f'SELECT starts_at AS start, ends_at AS end, type AS label, is_deleted FROM temporary_scoring_marker WHERE key_id = {manual_id};'
-            correction = pd.read_sql_query(query, con)
-            correction['start'] = pd.to_datetime(correction['start'].map(ticks_to_datetime))
-            correction['end'] = pd.to_datetime(correction['end'].map(ticks_to_datetime))
-            correction['is_deleted'] = correction['is_deleted'].astype(bool)
-            correction = correction.sort_values('start').drop_duplicates().reset_index(drop=True)
+            df_manual = pd.read_sql_query(query, con)
+            df_manual['start'] = pd.to_datetime(df_manual['start'].map(ticks_to_datetime))
+            df_manual['end'] = pd.to_datetime(df_manual['end'].map(ticks_to_datetime))
+            df_manual['is_deleted'] = df_manual['is_deleted'].astype(bool)
+            df_manual = df_manual.sort_values('start').drop_duplicates().reset_index(drop=True)
 
-            df = _apply_corrections(df, correction).drop_duplicates()
+            # Drop is_deleted annotations if only manual annotations are desired
+            if returned_annotations == 'manual':
+                df_manual = df_manual[~df_manual.is_deleted]
+            if idx == 0 and df.empty:
+                df = df_manual.copy()
+                continue
+
+            df = _apply_corrections(df, df_manual).drop_duplicates()
+
+        if df.empty:
+            return df
 
         # Crop annotations to fit inside the recording time
         record_start = self.getStartdatetime()
