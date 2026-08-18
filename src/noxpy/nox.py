@@ -1,11 +1,12 @@
 from copy import deepcopy
 import pandas as pd
-import pathlib
 import numpy as np
 import xml.etree.ElementTree as ET
 import struct
 import sqlite3
+import random
 from datetime import datetime
+from pathlib import Path
 
 def read_uint8(f):
     return struct.unpack('<B', f.read(1))[0]
@@ -111,7 +112,7 @@ COMPOSITE_CHANNELS = {
 class NoxReader:
 
     def __init__(self, path):
-        self.path = pathlib.Path(path)
+        self.path = Path(path)
         self.channel_headers = {}
         self.channel_data_locations = {}
         self.n_channels = 0
@@ -591,3 +592,87 @@ class NoxReader:
     def getPatientAdditional(self):
         self._ensure_recording_metadata()
         return self._subject_info.copy()
+
+    def export_anonymized(self, output_dir):
+        # Check if valid patient first
+        db_file = self.path / 'Data.ndb'
+        if not db_file.exists():
+            print(f'Skip patient {self.root} due to missing Data.ndb')
+            return
+        channel_paths = self.path.glob('*.ndf')
+
+        # Copy over raw channels and database file
+        for path in channel_paths:
+            path.copy(output_dir / path.name)
+        (self.path / 'DeviceEvents.nef').copy(output_dir / 'DeviceEvents.nef')
+
+        new_db_file = output_dir / 'Data.ndb'
+        db_file.copy(new_db_file)
+
+        # Open database and remove PII
+        fields_to_remove = [
+            'RoomId',
+            'FirstName',
+            'MiddleName',
+            'LastName',
+            'Notes',
+            'SocialSecurity',
+            'ID',
+            'Address',
+            'City',
+            'State',
+            'PostalCode',
+            'Phone',
+            'Email',
+            'SubjectGuid',
+            'FullName',
+        ]
+        with sqlite3.connect(new_db_file) as con:
+            con.executemany(
+                '''
+                UPDATE internal_property
+                SET value = ''
+                WHERE key = ?
+                ''',
+                [(field,) for field in fields_to_remove],
+            )
+
+            # Further anonymize measurements but keep them useful for downstream analysis
+            TICKS_PER_DAY = 24 * 60 * 60 * 10_000_000
+
+            # Birthday: +- n_days_jitter
+            n_days_jitter = 30
+            con.execute(
+                '''
+                UPDATE internal_property
+                SET value = CAST(value AS INTEGER)
+                          + (((random() & 0x7fffffffffffffff) % ?) - ?) * ?
+                WHERE key = 'DateOfBirth'
+                ''',
+                (2*n_days_jitter+1, n_days_jitter, TICKS_PER_DAY,),
+            )
+
+            # Height += n_meters
+            n_meters = 0.03
+            con.execute(
+                '''
+                UPDATE internal_property
+                SET value = ROUND(
+                            CAST(value AS REAL) + (random() / 9223372036854775808.0) * ?,
+                            2)
+                WHERE key = 'Height'
+                ''', (n_meters,)
+            )
+
+            # Weight: random shift of ± n_kg
+            n_kg = 3.0
+            con.execute(
+                '''
+                UPDATE internal_property
+                SET value = CAST(
+                                CAST(value AS REAL) + (random() / 9223372036854775808.0) * ?
+                            AS INTEGER)
+                WHERE key = 'Weight'
+                ''', (n_kg,)
+            )
+ 
