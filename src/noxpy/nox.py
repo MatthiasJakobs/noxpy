@@ -306,6 +306,18 @@ class NoxReader:
         finally:
             connection.close()
 
+    def isPAP(self):
+        # TODO: Any way to find this out without parsing the headers? 
+        self._ensure_channel_headers()
+        return any(['PAP' in label for label in self.getSignalLabels()])
+
+    def getDevice(self):
+        if self.isASV():
+            return 'ASV'
+        if self.isPAP():
+            return 'PAP'
+        return None
+
     def getSignalHeader(self, idx):
         self._ensure_channel_headers()
         return self.channel_headers[idx]
