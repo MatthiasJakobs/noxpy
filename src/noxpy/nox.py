@@ -119,6 +119,9 @@ class NoxReader:
         self._channel_headers_loaded = False
         self._metadata_loaded = False
 
+        if not self.path.joinpath('Data.ndb').exists():
+            raise RuntimeError(f'Folder {path} is not a valid Noxturnal recording: No Data.ndb file found')
+
     def _load_recording_metadata(self):
         db_file = self.path.joinpath('Data.ndb')
 
@@ -558,9 +561,6 @@ class NoxReader:
             return df_base
 
         db_file = self.path.joinpath('Data.ndb')
-        if not db_file.exists():
-            print('No database file available for patient', self.path)
-            return pd.DataFrame()
 
         con = sqlite3.connect(db_file)
         cur = con.cursor()
