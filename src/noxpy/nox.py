@@ -269,7 +269,38 @@ class NoxReader:
         if not self._channel_headers_loaded:
             self._read_channel_headers()
 
-    def isASV(self):
+    def _get_recording_type(self):
+        path = self.path / Path('Data.ndb')
+
+        connection = sqlite3.connect(path)
+
+        try:
+            row = connection.execute(f'SELECT Name FROM recording_type_entry LIMIT 1').fetchone()
+            if row is None:
+                return None
+            v = row[0].strip()
+            return v
+
+        except sqlite3.OperationalError as e:
+            connection.close()
+            print('Operation Error', e)
+            return None
+        finally:
+            connection.close()
+
+    def is_diagnostic(self):
+        v = self._get_recording_type()
+        return 'Diagnostik' in v or 'Diag' in v
+
+    def is_therapy(self):
+        v = self._get_recording_type()
+        return 'Therapie' in v 
+
+    def is_mslt(self):
+        v = self._get_recording_type()
+        return 'MSLT' in v 
+
+    def is_asv(self):
         device_events_file = self.path.joinpath('DeviceEvents.nef')
         if not device_events_file.exists():
             return False
@@ -307,15 +338,15 @@ class NoxReader:
         finally:
             connection.close()
 
-    def isPAP(self):
+    def is_pap(self):
         # TODO: Any way to find this out without parsing the headers? 
         self._ensure_channel_headers()
         return any(['PAP' in label for label in self.getSignalLabels()])
 
     def getDevice(self):
-        if self.isASV():
+        if self.is_asv():
             return 'ASV'
-        if self.isPAP():
+        if self.is_pap():
             return 'PAP'
         return None
 
