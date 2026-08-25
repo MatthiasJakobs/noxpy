@@ -565,10 +565,19 @@ class NoxReader:
         con = sqlite3.connect(db_file)
         cur = con.cursor()
 
+        # Infer correct table name
+        temporary_exists = cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", ('temporary_scoring_marker',)).fetchone() is not None
+        if temporary_exists:
+            scoring_key = 'temporary_scoring_key'
+            scoring_marker = 'temporary_scoring_marker'
+        else:
+            scoring_key = 'scoring_key'
+            scoring_marker = 'scoring_marker'
+
         df = pd.DataFrame()
         if returned_annotations in ['both', 'nox']:
             # Get automatic annotations first
-            query = 'SELECT t1.starts_at AS start, t1.ends_at AS end, t1.type AS label FROM temporary_scoring_marker t1 JOIN temporary_scoring_key t2 ON t1.key_id = t2.id WHERE t2.type = "Automatic"'
+            query = f'SELECT t1.starts_at AS start, t1.ends_at AS end, t1.type AS label FROM {scoring_marker} t1 JOIN {scoring_key} t2 ON t1.key_id = t2.id WHERE t2.type = "Automatic"'
             df_nox = pd.read_sql_query(query, con)
 
             df_nox['start'] = pd.to_datetime(df_nox['start'].map(ticks_to_datetime))
@@ -581,9 +590,9 @@ class NoxReader:
             df = df_nox
 
         # Iterate through manual annotations
-        res = cur.execute('SELECT id FROM temporary_scoring_key WHERE type = "Manual" ORDER BY id;').fetchall()
+        res = cur.execute(f'SELECT id FROM {scoring_key} WHERE type = "Manual" ORDER BY id;').fetchall()
         for idx, (manual_id,) in enumerate(res):
-            query = f'SELECT starts_at AS start, ends_at AS end, type AS label, is_deleted FROM temporary_scoring_marker WHERE key_id = {manual_id};'
+            query = f'SELECT starts_at AS start, ends_at AS end, type AS label, is_deleted FROM {scoring_marker} WHERE key_id = {manual_id};'
             df_manual = pd.read_sql_query(query, con)
             df_manual['start'] = pd.to_datetime(df_manual['start'].map(ticks_to_datetime))
             df_manual['end'] = pd.to_datetime(df_manual['end'].map(ticks_to_datetime))
