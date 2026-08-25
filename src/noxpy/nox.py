@@ -353,6 +353,125 @@ class NoxReader:
             return 'PAP'
         return None
 
+    def getParameters(self):
+        annotations = self.getAnnotations().copy()
+        annotations['duration'] = annotations['end'] - annotations['start']
+
+        sleep_labels = ['sleep-n1', 'sleep-n2', 'sleep-n3', 'sleep-rem']
+        apnea_labels = ['apnea-central', 'apnea-mixed', 'apnea-obstructive']
+        hypopnea_labels = ['hypopnea', 'hypopnea-central', 'hypopnea-obstructive']
+
+        sleep_annotations = annotations[annotations['label'].isin(sleep_labels)]
+        rem_annotations = annotations[annotations['label'] == 'sleep-rem']
+        supine_annotations = annotations[annotations['label'] == 'position-supine']
+
+        def duration_minutes(selected_annotations):
+            return selected_annotations['duration'].dt.total_seconds().sum() / 60
+
+        def overlap_minutes(first_annotations, second_annotations):
+            # Add the intersection of every interval pair. Sleep stages and body
+            # positions are each expected to be non-overlapping timelines.
+            seconds = 0.0
+            for first in first_annotations.itertuples():
+                for second in second_annotations.itertuples():
+                    overlap_start = max(first.start, second.start)
+                    overlap_end = min(first.end, second.end)
+                    if overlap_end > overlap_start:
+                        seconds += (overlap_end - overlap_start).total_seconds()
+
+            return seconds / 60
+
+        def events_during(event_labels, period_annotations):
+            # An event belongs to the sleep stage or position containing its
+            # start. Using a half-open interval avoids counting boundary events
+            # in two consecutive 30-second epochs.
+            events = annotations[annotations['label'].isin(event_labels)]
+            if events.empty or period_annotations.empty:
+                return events.iloc[0:0]
+
+            in_period = pd.Series(False, index=events.index)
+            for period in period_annotations.itertuples():
+                in_period |= (events['start'] >= period.start) & (events['start'] < period.end)
+
+            return events[in_period]
+
+        def index_per_hour(event_count, minutes):
+            if minutes == 0:
+                return np.nan
+            return event_count / (minutes / 60)
+
+        def percentage(minutes, total_minutes):
+            if total_minutes == 0:
+                return np.nan
+            return minutes / total_minutes * 100
+
+        # Sleep time and sleep architecture are sums of the scored 30-second
+        # epochs. Percentages use total sleep time as their denominator.
+        TST = duration_minutes(sleep_annotations)
+        rem_minutes = duration_minutes(rem_annotations)
+        n1_minutes = duration_minutes(annotations[annotations['label'] == 'sleep-n1'])
+        n2_minutes = duration_minutes(annotations[annotations['label'] == 'sleep-n2'])
+        n3_minutes = duration_minutes(annotations[annotations['label'] == 'sleep-n3'])
+
+        # Respiratory indices count events whose start lies in scored sleep and
+        # express that count per hour of the relevant sleep time.
+        apnea_events = events_during(apnea_labels, sleep_annotations)
+        hypopnea_events = events_during(hypopnea_labels, sleep_annotations)
+        respiratory_events = pd.concat([apnea_events, hypopnea_events])
+        rera_events = events_during(['rera'], sleep_annotations)
+
+        rem_respiratory_events = events_during(apnea_labels + hypopnea_labels, rem_annotations)
+        supine_sleep_minutes = overlap_minutes(sleep_annotations, supine_annotations)
+        non_supine_sleep_minutes = TST - supine_sleep_minutes
+        respiratory_events_while_supine = events_during(
+            apnea_labels + hypopnea_labels, supine_annotations
+        )
+        supine_respiratory_events = respiratory_events[
+            respiratory_events.index.isin(respiratory_events_while_supine.index)
+        ]
+        non_supine_respiratory_count = len(respiratory_events) - len(supine_respiratory_events)
+
+        # Nox exports the configured >=3% desaturations as
+        # `oxygensaturation-drop`; the annotation does not contain the measured
+        # saturation values themselves.
+        desaturation_events = events_during(['oxygensaturation-drop'], sleep_annotations)
+        periodic_limb_movements = events_during(['limbmovement-periodictwitch'], sleep_annotations)
+
+        # No REM sleep means that an REM-specific event rate is not defined.
+        AHI_REM = None
+        if rem_minutes > 0:
+            AHI_REM = index_per_hour(len(rem_respiratory_events), rem_minutes)
+
+        parameters = {
+            'AHI': index_per_hour(len(respiratory_events), TST),
+            'AHIREM': AHI_REM,
+            'AHISupine': index_per_hour(len(supine_respiratory_events), supine_sleep_minutes),
+            'AHINSupine': index_per_hour(non_supine_respiratory_count, non_supine_sleep_minutes),
+            'ODI3': index_per_hour(len(desaturation_events), TST),
+            'RDI': index_per_hour(len(respiratory_events) + len(rera_events), TST),
+            # TODO: These require sampled SpO2 data, which is not present in annotations.
+            # 'T90Time': None,
+            # 'T90Percent': None,
+            # 'SpO2Average': None,
+            'SupineDurationPercentageSleep': percentage(supine_sleep_minutes, TST),
+            'TST': TST,
+            'REMPercentage': percentage(rem_minutes, TST),
+            'N1Percentage': percentage(n1_minutes, TST),
+            'N2Percentage': percentage(n2_minutes, TST),
+            'N3Percentage': percentage(n3_minutes, TST),
+            'AI': index_per_hour(len(apnea_events), TST),
+            'HI': index_per_hour(len(hypopnea_events), TST),
+            'CAIndex': index_per_hour(len(events_during(['apnea-central'], sleep_annotations)), TST),
+            'OAIndex': index_per_hour(len(events_during(['apnea-obstructive'], sleep_annotations)), TST),
+            'LMinPLMIndex': index_per_hour(len(periodic_limb_movements), TST),
+            # TODO: These require sampled heart-rate data, which is not present in annotations.
+            # 'HeartRateMaximum': None,
+            # 'HeartRateMinimum': None,
+            # 'HeartRateAverage': None,
+        }
+
+        return parameters
+
     def getSignalHeader(self, idx):
         self._ensure_channel_headers()
         return self.channel_headers[idx]
