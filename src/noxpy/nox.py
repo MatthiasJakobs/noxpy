@@ -602,6 +602,8 @@ class NoxReader:
         channel_paths = self.path.glob('*.ndf')
 
         # Copy over raw channels and database file
+        output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True)
         for path in channel_paths:
             path.copy(output_dir / path.name)
         (self.path / 'DeviceEvents.nef').copy(output_dir / 'DeviceEvents.nef')
