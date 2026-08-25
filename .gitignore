@@ -9,3 +9,4 @@ test.png
 *.XML
 __pycache__
 *.egg-info
+DS_Store

@@ -4,9 +4,9 @@ import numpy as np
 import xml.etree.ElementTree as ET
 import struct
 import sqlite3
-import random
 from datetime import datetime
 from pathlib import Path
+from scipy.signal import find_peaks
 
 def read_uint8(f):
     return struct.unpack('<B', f.read(1))[0]
@@ -118,6 +118,9 @@ class NoxReader:
         self.n_channels = 0
         self._channel_headers_loaded = False
         self._metadata_loaded = False
+
+        if not self.path.joinpath('Data.ndb').exists():
+            raise RuntimeError(f'Folder {path} is not a valid Noxturnal recording: No Data.ndb file found')
 
     def _load_recording_metadata(self):
         db_file = self.path.joinpath('Data.ndb')
@@ -269,7 +272,38 @@ class NoxReader:
         if not self._channel_headers_loaded:
             self._read_channel_headers()
 
-    def isASV(self):
+    def _get_recording_type(self):
+        path = self.path / Path('Data.ndb')
+
+        connection = sqlite3.connect(path)
+
+        try:
+            row = connection.execute(f'SELECT Name FROM recording_type_entry LIMIT 1').fetchone()
+            if row is None:
+                return None
+            v = row[0].strip()
+            return v
+
+        except sqlite3.OperationalError as e:
+            connection.close()
+            print('Operation Error', e)
+            return None
+        finally:
+            connection.close()
+
+    def is_diagnostic(self):
+        v = self._get_recording_type()
+        return 'Diagnostik' in v or 'Diag' in v
+
+    def is_therapy(self):
+        v = self._get_recording_type()
+        return 'Therapie' in v 
+
+    def is_mslt(self):
+        v = self._get_recording_type()
+        return 'MSLT' in v 
+
+    def is_asv(self):
         device_events_file = self.path.joinpath('DeviceEvents.nef')
         if not device_events_file.exists():
             return False
@@ -307,17 +341,200 @@ class NoxReader:
         finally:
             connection.close()
 
-    def isPAP(self):
+    def is_pap(self):
         # TODO: Any way to find this out without parsing the headers? 
         self._ensure_channel_headers()
         return any(['PAP' in label for label in self.getSignalLabels()])
 
     def getDevice(self):
-        if self.isASV():
+        if self.is_asv():
             return 'ASV'
-        if self.isPAP():
+        if self.is_pap():
             return 'PAP'
         return None
+
+    def _calculate_hypoxic_burden(self, spo2_channel='SpO2'):
+        # Implements Esmaeili 2023: Hypoxic Burden Based on Automatically Identified Desaturations Is Associated with Adverse Health Outcomes
+
+        def find_desaturations(signal, p=3):
+            # First, get all local maxima
+            peaks, props = find_peaks(signal, plateau_size=1)
+            peaks = props['right_edges']
+            events = []
+
+            for i, peak in enumerate(peaks[:-1]):
+                end = peaks[i+1]
+                #low_point = peak + _argmin_last(signal[peak:end+1])
+                # The paper does not state whether the first, middle or last minimum value is to be chosen.
+                low_point = peak + np.argmin(signal[peak:end+1])
+                drop = signal[peak] - signal[low_point]
+                if drop >= p:
+                    events.append((peak, low_point, drop))
+
+            return np.array(events)
+
+        spo2_index = self.getSignalLabels().index(spo2_channel)
+        spo2_raw = self.readSignal(idx=spo2_index).copy()
+        spo2_raw[spo2_raw <= 40] = np.nan
+
+        sr = int(np.round(self.getSampleFrequency(spo2_index)))
+
+        desaturations = find_desaturations(spo2_raw, p=2)
+
+        window_widths = np.zeros((desaturations.shape[0], 2))
+        window_widths[:, 0] = desaturations[:, 1] - (sr*100)
+        window_widths[:, 1] = desaturations[:, 1] + (sr*100)
+        window_widths = window_widths.astype(np.int32)
+
+        # Plot overlapping curves
+        curves = np.zeros((window_widths.shape[0], int(sr*100*2)))
+        for i, (start, stop) in enumerate(window_widths):
+            if start <= 0 or stop <= 0:
+                continue
+            curve = spo2_raw[start:stop]
+            curves[i] = curve
+
+        # Find pre- and post-nadir points
+        average_curve = np.nanmean(curves, 0)
+        zero = int(sr * 100)
+
+        pre_peaks = find_peaks(average_curve[:zero])[0]
+        post_peaks = find_peaks(average_curve[zero:])[0] + zero
+
+        valid_pre = pre_peaks[pre_peaks <= zero - 10 * sr]
+
+        before = valid_pre[-1]
+        after = post_peaks[0]
+
+        # Calculate HB
+        start_values_desat = spo2_raw[desaturations[:, 0].astype(np.int32)]
+
+        total_burden_percent_per_minute = np.maximum(0, (start_values_desat[:, None] - curves[:, before:after])).sum() / (sr * 60)
+        #tst_hours = self.getParameters()['TST'] / 60
+        return total_burden_percent_per_minute 
+
+    def getParameters(self):
+        annotations = self.getAnnotations().copy()
+        annotations['duration'] = annotations['end'] - annotations['start']
+
+        sleep_labels = ['sleep-n1', 'sleep-n2', 'sleep-n3', 'sleep-rem']
+        apnea_labels = ['apnea-central', 'apnea-mixed', 'apnea-obstructive']
+        hypopnea_labels = ['hypopnea', 'hypopnea-central', 'hypopnea-obstructive']
+
+        sleep_annotations = annotations[annotations['label'].isin(sleep_labels)]
+        rem_annotations = annotations[annotations['label'] == 'sleep-rem']
+        supine_annotations = annotations[annotations['label'] == 'position-supine']
+
+        def duration_minutes(selected_annotations):
+            return selected_annotations['duration'].dt.total_seconds().sum() / 60
+
+        def overlap_minutes(first_annotations, second_annotations):
+            # Add the intersection of every interval pair. Sleep stages and body
+            # positions are each expected to be non-overlapping timelines.
+            seconds = 0.0
+            for first in first_annotations.itertuples():
+                for second in second_annotations.itertuples():
+                    overlap_start = max(first.start, second.start)
+                    overlap_end = min(first.end, second.end)
+                    if overlap_end > overlap_start:
+                        seconds += (overlap_end - overlap_start).total_seconds()
+
+            return seconds / 60
+
+        def events_during(event_labels, period_annotations):
+            # An event belongs to the sleep stage or position containing its
+            # start. Using a half-open interval avoids counting boundary events
+            # in two consecutive 30-second epochs.
+            events = annotations[annotations['label'].isin(event_labels)]
+            if events.empty or period_annotations.empty:
+                return events.iloc[0:0]
+
+            in_period = pd.Series(False, index=events.index)
+            for period in period_annotations.itertuples():
+                in_period |= (events['start'] >= period.start) & (events['start'] < period.end)
+
+            return events[in_period]
+
+        def index_per_hour(event_count, minutes):
+            if minutes == 0:
+                return np.nan
+            return event_count / (minutes / 60)
+
+        def percentage(minutes, total_minutes):
+            if total_minutes == 0:
+                return np.nan
+            return minutes / total_minutes * 100
+
+        # Sleep time and sleep architecture are sums of the scored 30-second
+        # epochs. Percentages use total sleep time as their denominator.
+        TST = duration_minutes(sleep_annotations)
+        rem_minutes = duration_minutes(rem_annotations)
+        n1_minutes = duration_minutes(annotations[annotations['label'] == 'sleep-n1'])
+        n2_minutes = duration_minutes(annotations[annotations['label'] == 'sleep-n2'])
+        n3_minutes = duration_minutes(annotations[annotations['label'] == 'sleep-n3'])
+
+        # Respiratory indices count events whose start lies in scored sleep and
+        # express that count per hour of the relevant sleep time.
+        apnea_events = events_during(apnea_labels, sleep_annotations)
+        hypopnea_events = events_during(hypopnea_labels, sleep_annotations)
+        respiratory_events = pd.concat([apnea_events, hypopnea_events])
+        rera_events = events_during(['rera'], sleep_annotations)
+
+        rem_respiratory_events = events_during(apnea_labels + hypopnea_labels, rem_annotations)
+        supine_sleep_minutes = overlap_minutes(sleep_annotations, supine_annotations)
+        non_supine_sleep_minutes = TST - supine_sleep_minutes
+        respiratory_events_while_supine = events_during(
+            apnea_labels + hypopnea_labels, supine_annotations
+        )
+        supine_respiratory_events = respiratory_events[
+            respiratory_events.index.isin(respiratory_events_while_supine.index)
+        ]
+        non_supine_respiratory_count = len(respiratory_events) - len(supine_respiratory_events)
+
+        # Nox exports the configured >=3% desaturations as
+        # `oxygensaturation-drop`; the annotation does not contain the measured
+        # saturation values themselves.
+        desaturation_events = events_during(['oxygensaturation-drop'], sleep_annotations)
+        periodic_limb_movements = events_during(['limbmovement-periodictwitch'], sleep_annotations)
+
+        # No REM sleep means that an REM-specific event rate is not defined.
+        AHI_REM = None
+        if rem_minutes > 0:
+            AHI_REM = index_per_hour(len(rem_respiratory_events), rem_minutes)
+
+        # Hypoxic Burden
+        hypoxic_burden = self._calculate_hypoxic_burden() / (TST / 60.)
+
+        parameters = {
+            'AHI': index_per_hour(len(respiratory_events), TST),
+            'AHIREM': AHI_REM,
+            'AHISupine': index_per_hour(len(supine_respiratory_events), supine_sleep_minutes),
+            'AHINSupine': index_per_hour(non_supine_respiratory_count, non_supine_sleep_minutes),
+            'ODI3': index_per_hour(len(desaturation_events), TST),
+            'RDI': index_per_hour(len(respiratory_events) + len(rera_events), TST),
+            # TODO: These require sampled SpO2 data, which is not present in annotations.
+            # 'T90Time': None,
+            # 'T90Percent': None,
+            # 'SpO2Average': None,
+            'SupineDurationPercentageSleep': percentage(supine_sleep_minutes, TST),
+            'TST': TST,
+            'REMPercentage': percentage(rem_minutes, TST),
+            'N1Percentage': percentage(n1_minutes, TST),
+            'N2Percentage': percentage(n2_minutes, TST),
+            'N3Percentage': percentage(n3_minutes, TST),
+            'AI': index_per_hour(len(apnea_events), TST),
+            'HI': index_per_hour(len(hypopnea_events), TST),
+            'CAIndex': index_per_hour(len(events_during(['apnea-central'], sleep_annotations)), TST),
+            'OAIndex': index_per_hour(len(events_during(['apnea-obstructive'], sleep_annotations)), TST),
+            'LMinPLMIndex': index_per_hour(len(periodic_limb_movements), TST),
+            'HypoxicBurden': hypoxic_burden,
+            # TODO: These require sampled heart-rate data, which is not present in annotations.
+            # 'HeartRateMaximum': None,
+            # 'HeartRateMinimum': None,
+            # 'HeartRateAverage': None,
+        }
+
+        return parameters
 
     def getSignalHeader(self, idx):
         self._ensure_channel_headers()
@@ -527,17 +744,23 @@ class NoxReader:
             return df_base
 
         db_file = self.path.joinpath('Data.ndb')
-        if not db_file.exists():
-            print('No database file available for patient', self.path)
-            return pd.DataFrame()
 
         con = sqlite3.connect(db_file)
         cur = con.cursor()
 
+        # Infer correct table name
+        temporary_exists = cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", ('temporary_scoring_marker',)).fetchone() is not None
+        if temporary_exists:
+            scoring_key = 'temporary_scoring_key'
+            scoring_marker = 'temporary_scoring_marker'
+        else:
+            scoring_key = 'scoring_key'
+            scoring_marker = 'scoring_marker'
+
         df = pd.DataFrame()
         if returned_annotations in ['both', 'nox']:
             # Get automatic annotations first
-            query = 'SELECT t1.starts_at AS start, t1.ends_at AS end, t1.type AS label FROM temporary_scoring_marker t1 JOIN temporary_scoring_key t2 ON t1.key_id = t2.id WHERE t2.type = "Automatic"'
+            query = f'SELECT t1.starts_at AS start, t1.ends_at AS end, t1.type AS label FROM {scoring_marker} t1 JOIN {scoring_key} t2 ON t1.key_id = t2.id WHERE t2.type = "Automatic"'
             df_nox = pd.read_sql_query(query, con)
 
             df_nox['start'] = pd.to_datetime(df_nox['start'].map(ticks_to_datetime))
@@ -550,9 +773,9 @@ class NoxReader:
             df = df_nox
 
         # Iterate through manual annotations
-        res = cur.execute('SELECT id FROM temporary_scoring_key WHERE type = "Manual" ORDER BY id;').fetchall()
+        res = cur.execute(f'SELECT id FROM {scoring_key} WHERE type = "Manual" ORDER BY id;').fetchall()
         for idx, (manual_id,) in enumerate(res):
-            query = f'SELECT starts_at AS start, ends_at AS end, type AS label, is_deleted FROM temporary_scoring_marker WHERE key_id = {manual_id};'
+            query = f'SELECT starts_at AS start, ends_at AS end, type AS label, is_deleted FROM {scoring_marker} WHERE key_id = {manual_id};'
             df_manual = pd.read_sql_query(query, con)
             df_manual['start'] = pd.to_datetime(df_manual['start'].map(ticks_to_datetime))
             df_manual['end'] = pd.to_datetime(df_manual['end'].map(ticks_to_datetime))
