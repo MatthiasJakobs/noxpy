@@ -15,7 +15,8 @@ authors = [
 
 dependencies = [
     'numpy',
-    'pandas'
+    'pandas',
+    'scipy'
 ]
 
 [tool.setuptools]

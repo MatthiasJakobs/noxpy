@@ -4,9 +4,9 @@ import numpy as np
 import xml.etree.ElementTree as ET
 import struct
 import sqlite3
-import random
 from datetime import datetime
 from pathlib import Path
+from scipy.signal import find_peaks
 
 def read_uint8(f):
     return struct.unpack('<B', f.read(1))[0]
@@ -353,6 +353,66 @@ class NoxReader:
             return 'PAP'
         return None
 
+    def _calculate_hypoxic_burden(self, spo2_channel='SpO2'):
+        # Implements Esmaeili 2023: Hypoxic Burden Based on Automatically Identified Desaturations Is Associated with Adverse Health Outcomes
+
+        def find_desaturations(signal, p=3):
+            # First, get all local maxima
+            peaks, props = find_peaks(signal, plateau_size=1)
+            peaks = props['right_edges']
+            events = []
+
+            for i, peak in enumerate(peaks[:-1]):
+                end = peaks[i+1]
+                #low_point = peak + _argmin_last(signal[peak:end+1])
+                # The paper does not state whether the first, middle or last minimum value is to be chosen.
+                low_point = peak + np.argmin(signal[peak:end+1])
+                drop = signal[peak] - signal[low_point]
+                if drop >= p:
+                    events.append((peak, low_point, drop))
+
+            return np.array(events)
+
+        spo2_index = self.getSignalLabels().index(spo2_channel)
+        spo2_raw = self.readSignal(idx=spo2_index).copy()
+        spo2_raw[spo2_raw <= 40] = np.nan
+
+        sr = int(np.round(self.getSampleFrequency(spo2_index)))
+
+        desaturations = find_desaturations(spo2_raw, p=2)
+
+        window_widths = np.zeros((desaturations.shape[0], 2))
+        window_widths[:, 0] = desaturations[:, 1] - (sr*100)
+        window_widths[:, 1] = desaturations[:, 1] + (sr*100)
+        window_widths = window_widths.astype(np.int32)
+
+        # Plot overlapping curves
+        curves = np.zeros((window_widths.shape[0], int(sr*100*2)))
+        for i, (start, stop) in enumerate(window_widths):
+            if start <= 0 or stop <= 0:
+                continue
+            curve = spo2_raw[start:stop]
+            curves[i] = curve
+
+        # Find pre- and post-nadir points
+        average_curve = np.nanmean(curves, 0)
+        zero = int(sr * 100)
+
+        pre_peaks = find_peaks(average_curve[:zero])[0]
+        post_peaks = find_peaks(average_curve[zero:])[0] + zero
+
+        valid_pre = pre_peaks[pre_peaks <= zero - 10 * sr]
+
+        before = valid_pre[-1]
+        after = post_peaks[0]
+
+        # Calculate HB
+        start_values_desat = spo2_raw[desaturations[:, 0].astype(np.int32)]
+
+        total_burden_percent_per_minute = np.maximum(0, (start_values_desat[:, None] - curves[:, before:after])).sum() / (sr * 60)
+        #tst_hours = self.getParameters()['TST'] / 60
+        return total_burden_percent_per_minute 
+
     def getParameters(self):
         annotations = self.getAnnotations().copy()
         annotations['duration'] = annotations['end'] - annotations['start']
@@ -442,6 +502,9 @@ class NoxReader:
         if rem_minutes > 0:
             AHI_REM = index_per_hour(len(rem_respiratory_events), rem_minutes)
 
+        # Hypoxic Burden
+        hypoxic_burden = self._calculate_hypoxic_burden() / (TST / 60.)
+
         parameters = {
             'AHI': index_per_hour(len(respiratory_events), TST),
             'AHIREM': AHI_REM,
@@ -464,6 +527,7 @@ class NoxReader:
             'CAIndex': index_per_hour(len(events_during(['apnea-central'], sleep_annotations)), TST),
             'OAIndex': index_per_hour(len(events_during(['apnea-obstructive'], sleep_annotations)), TST),
             'LMinPLMIndex': index_per_hour(len(periodic_limb_movements), TST),
+            'HypoxicBurden': hypoxic_burden,
             # TODO: These require sampled heart-rate data, which is not present in annotations.
             # 'HeartRateMaximum': None,
             # 'HeartRateMinimum': None,
