@@ -7,6 +7,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 from scipy.signal import find_peaks
+from noxpy.utils import find_desaturations
 
 def read_uint8(f):
     return struct.unpack('<B', f.read(1))[0]
@@ -356,23 +357,6 @@ class NoxReader:
     def _calculate_hypoxic_burden(self, spo2_channel='SpO2'):
         # Implements Esmaeili 2023: Hypoxic Burden Based on Automatically Identified Desaturations Is Associated with Adverse Health Outcomes
 
-        def find_desaturations(signal, p=3):
-            # First, get all local maxima
-            peaks, props = find_peaks(signal, plateau_size=1)
-            peaks = props['right_edges']
-            events = []
-
-            for i, peak in enumerate(peaks[:-1]):
-                end = peaks[i+1]
-                #low_point = peak + _argmin_last(signal[peak:end+1])
-                # The paper does not state whether the first, middle or last minimum value is to be chosen.
-                low_point = peak + np.argmin(signal[peak:end+1])
-                drop = signal[peak] - signal[low_point]
-                if drop >= p:
-                    events.append((peak, low_point, drop))
-
-            return np.array(events)
-
         spo2_index = self.getSignalLabels().index(spo2_channel)
         spo2_raw = self.readSignal(idx=spo2_index).copy()
         spo2_raw[spo2_raw <= 40] = np.nan
@@ -389,7 +373,7 @@ class NoxReader:
         # Plot overlapping curves
         curves = np.zeros((window_widths.shape[0], int(sr*100*2)))
         for i, (start, stop) in enumerate(window_widths):
-            if start <= 0 or stop <= 0:
+            if start <= 0 or stop <= 0 or start >= len(spo2_raw) or stop >= len(spo2_raw):
                 continue
             curve = spo2_raw[start:stop]
             curves[i] = curve
@@ -503,7 +487,10 @@ class NoxReader:
             AHI_REM = index_per_hour(len(rem_respiratory_events), rem_minutes)
 
         # Hypoxic Burden
-        hypoxic_burden = self._calculate_hypoxic_burden() / (TST / 60.)
+        if TST == 0:
+            hypoxic_burden = None
+        else:
+            hypoxic_burden = self._calculate_hypoxic_burden() / (TST / 60.)
 
         parameters = {
             'AHI': index_per_hour(len(respiratory_events), TST),
