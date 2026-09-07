@@ -182,6 +182,11 @@ class NoxReader:
 
             while f.tell() < file_size:
                 # Read block and determine action
+                remaining = file_size - f.tell()
+                if remaining <= 6:
+                    # Done. Not enough data to parse a block
+                    break
+
                 typ = read_uint16(f)
                 length = read_uint32(f)
 
@@ -243,7 +248,7 @@ class NoxReader:
         i = 0
         for channel_path in channel_paths:
             channel_header, channel_data_location = self._parse_ndf_header(channel_path)
-            total_channel_length = sum([cd['length'] for cd in channel_data_location['chunk_information']])
+            total_channel_length = sum([cd['length'] if 'length' in cd else 0 for cd in channel_data_location['chunk_information']])
             if total_channel_length <= 0:
                 # Sometimes there is only one block of length zero -> skip the channel (pretend it does not exist)
                 continue
@@ -357,6 +362,9 @@ class NoxReader:
     def _calculate_hypoxic_burden(self, spo2_channel='SpO2'):
         # Implements Esmaeili 2023: Hypoxic Burden Based on Automatically Identified Desaturations Is Associated with Adverse Health Outcomes
 
+        if spo2_channel not in self.getSignalLabels():
+            return None
+
         spo2_index = self.getSignalLabels().index(spo2_channel)
         spo2_raw = self.readSignal(idx=spo2_index).copy()
         spo2_raw[spo2_raw <= 40] = np.nan
@@ -364,6 +372,12 @@ class NoxReader:
         sr = int(np.round(self.getSampleFrequency(spo2_index)))
 
         desaturations = find_desaturations(spo2_raw, p=2)
+
+        if len(desaturations) == 0:
+            # No desaturations -> Currently no way to calculate HypoxicBurden
+            # TODO: We could optionally implement the other HB variants that don't rely on desaturations 
+            # (altough it is quesionable how many respiratory events are left)
+            return None
 
         window_widths = np.zeros((desaturations.shape[0], 2))
         window_widths[:, 0] = desaturations[:, 1] - (sr*100)
@@ -376,6 +390,8 @@ class NoxReader:
             if start <= 0 or stop <= 0 or start >= len(spo2_raw) or stop >= len(spo2_raw):
                 continue
             curve = spo2_raw[start:stop]
+            if len(curve) != curves.shape[1]:
+                continue
             curves[i] = curve
 
         # Find pre- and post-nadir points
@@ -398,7 +414,32 @@ class NoxReader:
         return total_burden_percent_per_minute 
 
     def getParameters(self):
+        parameters = {
+            'Apneas': None,
+            'Hypopneas': None,
+            'AHI': None,
+            'AHIREM': None,
+            'AHISupine': None,
+            'AHINSupine': None,
+            'ODI3': None,
+            'RDI': None,
+            'SupineDurationPercentageSleep': None,
+            'TST': None,
+            'REMPercentage': None,
+            'N1Percentage': None,
+            'N2Percentage': None,
+            'N3Percentage': None,
+            'AI': None,
+            'HI': None,
+            'CAIndex': None,
+            'OAIndex': None,
+            'LMinPLMIndex': None,
+            'HypoxicBurden': None,
+        }
         annotations = self.getAnnotations().copy()
+        if len(annotations) == 0:
+            # No annotations present, so no parameters can be computed
+            return parameters
         annotations['duration'] = annotations['end'] - annotations['start']
 
         sleep_labels = ['sleep-n1', 'sleep-n2', 'sleep-n3', 'sleep-rem']
@@ -490,9 +531,15 @@ class NoxReader:
         if TST == 0:
             hypoxic_burden = None
         else:
-            hypoxic_burden = self._calculate_hypoxic_burden() / (TST / 60.)
+            raw_hb = self._calculate_hypoxic_burden()
+            if raw_hb is None:
+                hypoxic_burden = None
+            else:
+                hypoxic_burden =  raw_hb / (TST / 60.)
 
         parameters = {
+            'Apneas': len(apnea_events),
+            'Hypopneas': len(hypopnea_events),
             'AHI': index_per_hour(len(respiratory_events), TST),
             'AHIREM': AHI_REM,
             'AHISupine': index_per_hour(len(supine_respiratory_events), supine_sleep_minutes),
@@ -734,6 +781,7 @@ class NoxReader:
 
         con = sqlite3.connect(db_file)
         cur = con.cursor()
+        df = pd.DataFrame()
 
         # Infer correct table name
         temporary_exists = cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", ('temporary_scoring_marker',)).fetchone() is not None
@@ -741,10 +789,14 @@ class NoxReader:
             scoring_key = 'temporary_scoring_key'
             scoring_marker = 'temporary_scoring_marker'
         else:
-            scoring_key = 'scoring_key'
-            scoring_marker = 'scoring_marker'
+            scoring_exists = cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", ('scoring_marker',)).fetchone() is not None
+            if scoring_exists:
+                scoring_key = 'scoring_key'
+                scoring_marker = 'scoring_marker'
+            else:
+                # Neither temporary_scoring_marker nor scoring_marker exists; Return no annotations 
+                return df
 
-        df = pd.DataFrame()
         if returned_annotations in ['both', 'nox']:
             # Get automatic annotations first
             query = f'SELECT t1.starts_at AS start, t1.ends_at AS end, t1.type AS label FROM {scoring_marker} t1 JOIN {scoring_key} t2 ON t1.key_id = t2.id WHERE t2.type = "Automatic"'
