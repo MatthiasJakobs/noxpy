@@ -4,6 +4,8 @@ import numpy as np
 import xml.etree.ElementTree as ET
 import struct
 import sqlite3
+import zipfile
+import io
 from datetime import datetime
 from pathlib import Path
 from scipy.signal import find_peaks
@@ -939,4 +941,51 @@ class NoxReader:
                 WHERE key = 'Weight'
                 ''', (n_kg,)
             )
- 
+  
+    def export_report(self, output_path, ignore_missing_report=True):
+        db_path = self.path / 'Data.ndb'
+        conn = sqlite3.connect(str(db_path))
+        # Try standard table, fall back to temporary variant
+        te = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_workspace'"
+        ).fetchone()
+        if not te:
+            te = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='temporary_workspace_workspace'"
+            ).fetchone()
+            table_name = 'temporary_workspace_workspace' if te else 'workspace_workspace'
+        else:
+            table_name = 'workspace_workspace'
+        if not te:
+            conn.close()
+            if ignore_missing_report:
+                return None
+            conn.close()
+            raise ValueError("No workspace table found in " + str(db_path))
+        rows = conn.execute(
+            "SELECT data FROM " + table_name + " WHERE data IS NOT NULL"
+        ).fetchall()
+        conn.close()
+        out = Path(output_path)
+        for (blob,) in rows:
+            if not isinstance(blob, bytes):
+                continue
+            pp = blob.find(b'PK')
+            if pp >= 0:
+                zd = blob[pp:]
+                try:
+                    with zipfile.ZipFile(io.BytesIO(zd)) as zf:
+                        zf.testzip()
+                    out = out.with_suffix('.docx')
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    with open(out, 'wb') as f:
+                        f.write(zd)
+                    return out
+                except Exception:
+                    continue
+        if ignore_missing_report:
+            return None
+        raise ValueError(
+            'No clinical report found in ' + str(db_path) + '. '
+            'This patient data contains no exported report.'
+        )
