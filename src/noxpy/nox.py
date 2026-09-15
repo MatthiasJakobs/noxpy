@@ -989,3 +989,12 @@ class NoxReader:
             'No clinical report found in ' + str(db_path) + '. '
             'This patient data contains no exported report.'
         )
+
+    def getAllDevices(self):
+        db_file = self.path / 'Data.ndb'
+        devices = []
+        with sqlite3.connect(db_file) as con:
+            devices = list(map(lambda x: x[0], con.execute('SELECT Name from device_info').fetchall()))
+
+        return devices
+
